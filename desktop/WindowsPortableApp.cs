@@ -952,6 +952,31 @@ namespace LanMediaController
                         {
                             IngestRemoteSyncPayload(dict, ep.Address.ToString());
                         }
+                        else if (type == "state" && dict.ContainsKey("deviceId"))
+                        {
+                            string id = Convert.ToString(dict["deviceId"]);
+                            if (!string.IsNullOrEmpty(id) && !DevicesMap.ContainsKey(id))
+                            {
+                                var rec = RemoteLanDevices.GetOrAdd(id, _id => new DeviceRecord { deviceId = _id });
+                                rec.deviceName = dict.ContainsKey("deviceName") ? Convert.ToString(dict["deviceName"]) : "iOS 设备";
+                                rec.platform = dict.ContainsKey("platform") ? Convert.ToString(dict["platform"]) : "ios";
+                                rec.roomCode = dict.ContainsKey("roomCode") ? Convert.ToString(dict["roomCode"]) : "";
+                                if (!string.IsNullOrEmpty(rec.roomCode)) ActiveRooms.TryAdd(rec.roomCode, true);
+                                rec.ip = ep.Address.ToString();
+                                rec.httpPort = 19889;
+                                rec.lastSeen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                                var pDict = dict.ContainsKey("player") ? dict["player"] as Dictionary<string, object> : null;
+                                if (pDict != null)
+                                {
+                                    if (rec.player == null) rec.player = new PlayerState();
+                                    if (pDict.ContainsKey("title")) rec.player.title = Convert.ToString(pDict["title"]);
+                                    if (pDict.ContainsKey("isPlaying")) rec.player.isPlaying = Convert.ToBoolean(pDict["isPlaying"]);
+                                    if (pDict.ContainsKey("position")) rec.player.position = Convert.ToDouble(pDict["position"]);
+                                    if (pDict.ContainsKey("duration")) rec.player.duration = Convert.ToDouble(pDict["duration"]);
+                                }
+                            }
+                        }
                         else if (type == "command")
                         {
                             string targetId = dict.ContainsKey("targetDeviceId") ? Convert.ToString(dict["targetDeviceId"]) : "";
