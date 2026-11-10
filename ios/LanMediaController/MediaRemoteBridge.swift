@@ -5,7 +5,7 @@ import NetworkExtension
 import UIKit
 
 /// 房间内单个设备播放器数据模型
-struct PlayerItem: Identifiable, Codable {
+struct PlayerItem: Identifiable, Codable, Equatable {
     var id: String { deviceId }
     var deviceId: String
     var deviceName: String
@@ -17,6 +17,17 @@ struct PlayerItem: Identifiable, Codable {
     var duration: Double
     var ip: String
     var httpPort: Int
+
+    static func == (lhs: PlayerItem, rhs: PlayerItem) -> Bool {
+        return lhs.deviceId == rhs.deviceId &&
+               lhs.deviceName == rhs.deviceName &&
+               lhs.platform == rhs.platform &&
+               lhs.roomCode == rhs.roomCode &&
+               lhs.title == rhs.title &&
+               lhs.isPlaying == rhs.isPlaying &&
+               abs(lhs.position - rhs.position) < 1.0 &&
+               abs(lhs.duration - rhs.duration) < 1.0
+    }
 }
 
 /// iOS 后台保活 + 4位数房间匹配系统 + 双通道实时同步 (ntfy.sh Relay + LAN UDP) + 系统媒体控制
@@ -52,8 +63,10 @@ final class MediaRemoteBridge: ObservableObject {
     private var localDuration: Double = 300
     private var localTitle: String = "第 1 章"
     private var remoteMap: [String: PlayerItem] = [:]
+    private var peerLastTsMap: [String: Double] = [:]
     private var executedCmdIds = Set<String>()
-    private var lastRelayPollTime: TimeInterval = 0
+    private var lastPollTimestamp: Double = 0
+    private var isPollingRelay: Bool = false
 
     private let relayBase = "https://ntfy.sh"
     private let lobbyTopic = "lmc_sync_lobby_v3_global"
@@ -96,6 +109,8 @@ final class MediaRemoteBridge: ObservableObject {
     private func joinRoomInternal(code: String, isNewJoin: Bool) {
         currentRoomCode = code
         remoteMap.removeAll()
+        peerLastTsMap.removeAll()
+        lastPollTimestamp = Date().timeIntervalSince1970 - 120
         refreshRoomPlayers()
 
         // 1. 广播 Presence 到 Relay
@@ -123,12 +138,13 @@ final class MediaRemoteBridge: ObservableObject {
         currentRoomCode = ""
         stopRoomRelayPolling()
         remoteMap.removeAll()
+        peerLastTsMap.removeAll()
         broadcastUDPState()
         refreshRoomPlayers()
     }
 
     // ============================================================================
-    // Relay 通道 (ntfy.sh) - 穿透 AP 隔离与单向防火墙，实现与 Mac/Windows 秒级互显
+    // Relay 通道 (ntfy.sh) - 消除历史消息重放导致的界面闪烁
     // ============================================================================
 
     private func publishRelay(topic: String, payload: [String: Any]) {
@@ -136,6 +152,7 @@ final class MediaRemoteBridge: ObservableObject {
               let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        req.timeoutInterval = 3.0
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = data
         URLSession.shared.dataTask(with: req).resume()
@@ -187,7 +204,8 @@ final class MediaRemoteBridge: ObservableObject {
                 if let rawJson = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)) as? [String: Any],
                    let msgStr = rawJson["message"] as? String,
                    let msg = try? JSONSerialization.jsonObject(with: Data(msgStr.utf8)) as? [String: Any] {
-                    if let netLan = msg["lanName"] as? String, !netLan.isEmpty, self.lanName == "正在获取局域网..." || self.lanName == "局域网 Wi-Fi" {
+                    if let netLan = msg["lanName"] as? String, !netLan.isEmpty,
+                       self.lanName == "正在获取局域网..." || self.lanName == "局域网 Wi-Fi" {
                         DispatchQueue.main.async { self.lanName = netLan }
                     }
                 }
@@ -197,9 +215,8 @@ final class MediaRemoteBridge: ObservableObject {
 
     private func startRoomRelayPolling() {
         stopRoomRelayPolling()
-        lastRelayPollTime = Date().timeIntervalSince1970 - 120
         pollRoomRelayOnce()
-        relayPollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        relayPollTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in
             self?.pollRoomRelayOnce()
         }
     }
@@ -210,74 +227,114 @@ final class MediaRemoteBridge: ObservableObject {
     }
 
     private func pollRoomRelayOnce() {
-        guard !currentRoomCode.isEmpty else { return }
+        guard !currentRoomCode.isEmpty, !isPollingRelay else { return }
         let code = currentRoomCode
-        let sinceStr = "2m"
-        guard let url = URL(string: "\(relayBase)/lmc_sync_room_v3_\(code)/json?poll=1&since=\(sinceStr)") else { return }
+        let sinceParam = lastPollTimestamp > 0 ? "\(Int(lastPollTimestamp))" : "2m"
+        guard let url = URL(string: "\(relayBase)/lmc_sync_room_v3_\(code)/json?poll=1&since=\(sinceParam)") else { return }
 
+        isPollingRelay = true
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            guard let self = self, let data = data, let text = String(data: data, encoding: .utf8) else { return }
-            for line in text.components(separatedBy: "\n") {
+            guard let self = self else { return }
+            defer { self.isPollingRelay = false }
+            guard let data = data, let text = String(data: data, encoding: .utf8) else { return }
+
+            var hasChanges = false
+            var shouldReplyPresence = false
+            var maxTimestampSeen = self.lastPollTimestamp
+
+            let lines = text.components(separatedBy: "\n")
+            for line in lines {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmed.isEmpty { continue }
-                self.processRelayRoomLine(trimmed)
+
+                guard let outer = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)) as? [String: Any],
+                      let msgStr = outer["message"] as? String,
+                      let msg = try? JSONSerialization.jsonObject(with: Data(msgStr.utf8)) as? [String: Any],
+                      let room = msg["roomCode"] as? String, room == self.currentRoomCode,
+                      let type = msg["type"] as? String else { continue }
+
+                let outerTime = Double(outer["time"] as? Int ?? 0)
+                let msgTs = Double(msg["ts"] as? Int ?? 0)
+                let eventTs = msgTs > 0 ? msgTs : (outerTime * 1000)
+
+                if outerTime > maxTimestampSeen {
+                    maxTimestampSeen = outerTime
+                }
+
+                if let remoteLan = msg["lanName"] as? String, !remoteLan.isEmpty,
+                   self.lanName == "正在获取局域网..." || self.lanName == "局域网 Wi-Fi" {
+                    DispatchQueue.main.async { self.lanName = remoteLan }
+                }
+
+                if type == "presence", let dev = msg["device"] as? [String: Any],
+                   let peerId = dev["deviceId"] as? String, peerId != self.deviceId {
+
+                    // 时间戳防倒退检查：旧状态决不覆盖新状态
+                    let prevTs = self.peerLastTsMap[peerId] ?? 0
+                    if eventTs >= prevTs {
+                        self.peerLastTsMap[peerId] = eventTs
+                        let p = dev["player"] as? [String: Any] ?? [:]
+                        let item = PlayerItem(
+                            deviceId: peerId,
+                            deviceName: dev["deviceName"] as? String ?? "设备",
+                            platform: dev["platform"] as? String ?? "windows",
+                            roomCode: room,
+                            title: p["title"] as? String ?? "第 1 章",
+                            isPlaying: p["isPlaying"] as? Bool ?? false,
+                            position: p["position"] as? Double ?? 0,
+                            duration: p["duration"] as? Double ?? 300,
+                            ip: dev["ip"] as? String ?? "127.0.0.1",
+                            httpPort: dev["httpPort"] as? Int ?? 19889
+                        )
+                        self.remoteMap[peerId] = item
+                        hasChanges = true
+                    }
+
+                    if let isNew = msg["isNewJoin"] as? Bool, isNew {
+                        let nowMs = Date().timeIntervalSince1970 * 1000
+                        if nowMs - eventTs < 6000 {
+                            shouldReplyPresence = true
+                        }
+                    }
+                } else if type == "leave", let peerId = msg["deviceId"] as? String {
+                    let prevTs = self.peerLastTsMap[peerId] ?? 0
+                    // 只有当 leave 的时间戳晚于最后一次 presence 时，才执行移除！
+                    if eventTs >= prevTs {
+                        self.peerLastTsMap[peerId] = eventTs
+                        self.remoteMap.removeValue(forKey: peerId)
+                        hasChanges = true
+                    }
+                } else if type == "command" {
+                    guard let target = msg["targetDeviceId"] as? String, target == self.deviceId else { continue }
+                    let cmdId = msg["cmdId"] as? String ?? "\(target)_\(eventTs)"
+                    if self.executedCmdIds.contains(cmdId) { continue }
+                    self.executedCmdIds.insert(cmdId)
+
+                    let act = msg["action"] as? String ?? "toggle"
+                    let pos = msg["position"] as? Double
+                    DispatchQueue.main.async {
+                        self.executeLocalCommand(action: act, position: pos)
+                    }
+                }
             }
-        }.resume()
-    }
 
-    private func processRelayRoomLine(_ line: String) {
-        guard let outer = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-              let msgStr = outer["message"] as? String,
-              let msg = try? JSONSerialization.jsonObject(with: Data(msgStr.utf8)) as? [String: Any],
-              let room = msg["roomCode"] as? String, room == currentRoomCode,
-              let type = msg["type"] as? String else { return }
-
-        if let remoteLan = msg["lanName"] as? String, !remoteLan.isEmpty,
-           self.lanName == "正在获取局域网..." || self.lanName == "局域网 Wi-Fi" {
-            DispatchQueue.main.async { self.lanName = remoteLan }
-        }
-
-        if type == "presence", let dev = msg["device"] as? [String: Any],
-           let peerId = dev["deviceId"] as? String, peerId != deviceId {
-            let p = dev["player"] as? [String: Any] ?? [:]
-            let item = PlayerItem(
-                deviceId: peerId,
-                deviceName: dev["deviceName"] as? String ?? "设备",
-                platform: dev["platform"] as? String ?? "windows",
-                roomCode: room,
-                title: p["title"] as? String ?? "第 1 章",
-                isPlaying: p["isPlaying"] as? Bool ?? false,
-                position: p["position"] as? Double ?? 0,
-                duration: p["duration"] as? Double ?? 300,
-                ip: dev["ip"] as? String ?? "127.0.0.1",
-                httpPort: dev["httpPort"] as? Int ?? 19889
-            )
-            DispatchQueue.main.async {
-                self.remoteMap[peerId] = item
-                self.refreshRoomPlayers()
+            if maxTimestampSeen > self.lastPollTimestamp {
+                self.lastPollTimestamp = maxTimestampSeen
             }
-            if let isNew = msg["isNewJoin"] as? Bool, isNew {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+
+            // 批量处理完毕后，只在主线程统一刷新一次 UI，彻底杜绝闪烁
+            if hasChanges {
+                DispatchQueue.main.async {
+                    self.refreshRoomPlayers()
+                }
+            }
+
+            if shouldReplyPresence {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                     self.broadcastRoomPresence(isNewJoin: false)
                 }
             }
-        } else if type == "leave", let peerId = msg["deviceId"] as? String {
-            DispatchQueue.main.async {
-                self.remoteMap.removeValue(forKey: peerId)
-                self.refreshRoomPlayers()
-            }
-        } else if type == "command" {
-            guard let target = msg["targetDeviceId"] as? String, target == deviceId else { return }
-            let cmdId = msg["cmdId"] as? String ?? "\(target)_\(Date().timeIntervalSince1970)"
-            if executedCmdIds.contains(cmdId) { return }
-            executedCmdIds.insert(cmdId)
-
-            let act = msg["action"] as? String ?? "toggle"
-            let pos = msg["position"] as? Double
-            DispatchQueue.main.async {
-                self.executeLocalCommand(action: act, position: pos)
-            }
-        }
+        }.resume()
     }
 
     // ============================================================================
@@ -433,7 +490,7 @@ final class MediaRemoteBridge: ObservableObject {
     }
 
     // ============================================================================
-    // 局域网 UDP 广播与套接字支持
+    // 局域网 UDP 广播与套接字支持 (防空房间号覆盖)
     // ============================================================================
 
     private func setupUDPSocket() {
@@ -496,43 +553,51 @@ final class MediaRemoteBridge: ObservableObject {
                 DispatchQueue.main.async { self.lanName = remoteLan }
             }
             if let devArr = json["devices"] as? [[String: Any]] {
-                DispatchQueue.main.async {
-                    for d in devArr {
-                        guard let devId = d["deviceId"] as? String, devId != self.deviceId else { continue }
-                        let p = d["player"] as? [String: Any] ?? [:]
-                        let item = PlayerItem(
-                            deviceId: devId,
-                            deviceName: d["deviceName"] as? String ?? "设备",
-                            platform: d["platform"] as? String ?? "windows",
-                            roomCode: d["roomCode"] as? String ?? "",
-                            title: p["title"] as? String ?? "第 1 章",
-                            isPlaying: p["isPlaying"] as? Bool ?? false,
-                            position: p["position"] as? Double ?? 0,
-                            duration: p["duration"] as? Double ?? 300,
-                            ip: d["ip"] as? String ?? senderIP,
-                            httpPort: d["httpPort"] as? Int ?? 19889
-                        )
-                        self.remoteMap[devId] = item
+                var changed = false
+                for d in devArr {
+                    guard let devId = d["deviceId"] as? String, devId != self.deviceId else { continue }
+                    // 关键检查：如果 UDP 里的设备没有在相同房间内，决不写入 remoteMap！
+                    guard let rCode = d["roomCode"] as? String, !rCode.isEmpty, rCode == self.currentRoomCode else { continue }
+
+                    let p = d["player"] as? [String: Any] ?? [:]
+                    let item = PlayerItem(
+                        deviceId: devId,
+                        deviceName: d["deviceName"] as? String ?? "设备",
+                        platform: d["platform"] as? String ?? "windows",
+                        roomCode: rCode,
+                        title: p["title"] as? String ?? "第 1 章",
+                        isPlaying: p["isPlaying"] as? Bool ?? false,
+                        position: p["position"] as? Double ?? 0,
+                        duration: p["duration"] as? Double ?? 300,
+                        ip: d["ip"] as? String ?? senderIP,
+                        httpPort: d["httpPort"] as? Int ?? 19889
+                    )
+                    self.remoteMap[devId] = item
+                    changed = true
+                }
+                if changed {
+                    DispatchQueue.main.async {
+                        self.refreshRoomPlayers()
                     }
-                    self.refreshRoomPlayers()
                 }
             }
         } else if type == "state" {
             guard let devId = json["deviceId"] as? String, devId != deviceId else { return }
+            guard let rCode = json["roomCode"] as? String, !rCode.isEmpty, rCode == self.currentRoomCode else { return }
             let p = json["player"] as? [String: Any] ?? [:]
+            let item = PlayerItem(
+                deviceId: devId,
+                deviceName: json["deviceName"] as? String ?? "设备",
+                platform: json["platform"] as? String ?? "ios",
+                roomCode: rCode,
+                title: p["title"] as? String ?? "第 1 章",
+                isPlaying: p["isPlaying"] as? Bool ?? false,
+                position: p["position"] as? Double ?? 0,
+                duration: p["duration"] as? Double ?? 300,
+                ip: json["ip"] as? String ?? senderIP,
+                httpPort: json["httpPort"] as? Int ?? 19889
+            )
             DispatchQueue.main.async {
-                let item = PlayerItem(
-                    deviceId: devId,
-                    deviceName: json["deviceName"] as? String ?? "设备",
-                    platform: json["platform"] as? String ?? "ios",
-                    roomCode: json["roomCode"] as? String ?? "",
-                    title: p["title"] as? String ?? "第 1 章",
-                    isPlaying: p["isPlaying"] as? Bool ?? false,
-                    position: p["position"] as? Double ?? 0,
-                    duration: p["duration"] as? Double ?? 300,
-                    ip: json["ip"] as? String ?? senderIP,
-                    httpPort: json["httpPort"] as? Int ?? 19889
-                )
                 self.remoteMap[devId] = item
                 self.refreshRoomPlayers()
             }
@@ -598,7 +663,9 @@ final class MediaRemoteBridge: ObservableObject {
 
     private func refreshRoomPlayers() {
         guard !currentRoomCode.isEmpty else {
-            self.roomPlayers = []
+            if !self.roomPlayers.isEmpty {
+                self.roomPlayers = []
+            }
             return
         }
         let selfItem = PlayerItem(
@@ -616,6 +683,10 @@ final class MediaRemoteBridge: ObservableObject {
         var list = [selfItem]
         let matched = remoteMap.values.filter { $0.roomCode == currentRoomCode }
         list.append(contentsOf: matched.sorted(by: { $0.deviceName < $1.deviceName }))
-        self.roomPlayers = list
+
+        // 仅在列表内容确实发生变化时才更新 @Published，彻底杜绝 SwiftUI 重复刷新闪烁
+        if self.roomPlayers != list {
+            self.roomPlayers = list
+        }
     }
 }
