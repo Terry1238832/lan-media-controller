@@ -617,8 +617,8 @@
     const discoveredRoomsSet = new Set();
 
     const hasLocalBackend = (
-      (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') &&
-      window.location.port === '19889'
+      window.location.protocol === 'http:' &&
+      (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost')
     ) || Boolean(window.__API_BASE_URL__);
     let apiBaseUrl = window.__API_BASE_URL__ || '';
 

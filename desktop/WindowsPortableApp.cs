@@ -42,7 +42,7 @@ namespace LanMediaController
     static class Program
     {
         private const int UDP_PORT = 19888;
-        private const int HTTP_PORT = 19889;
+        private static int HTTP_PORT = 8889;
 
         private static readonly string HostDeviceId = "win-" + Environment.MachineName.ToLowerInvariant();
         private static readonly ConcurrentDictionary<string, DeviceRecord> DevicesMap = new ConcurrentDictionary<string, DeviceRecord>();
@@ -114,12 +114,7 @@ namespace LanMediaController
             Application.SetCompatibleTextRenderingDefault(false);
 
             DetectNetworkProfileFromRegistry();
-
-            if (IsPortInUse(HTTP_PORT))
-            {
-                KillPreviousListener(HTTP_PORT);
-                Thread.Sleep(400);
-            }
+            KillPreviousListener(HTTP_PORT);
 
             LoadEmbeddedResources();
             StartWinBridgeProcess();
@@ -174,16 +169,18 @@ namespace LanMediaController
         {
             try
             {
-                int myPid = Process.GetCurrentProcess().Id;
-                var psi = new ProcessStartInfo
+                var cur = Process.GetCurrentProcess();
+                foreach (var p in Process.GetProcessesByName(cur.ProcessName))
                 {
-                    FileName = "cmd.exe",
-                    Arguments = "/c for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :" + port + " ^| findstr LISTENING') do @if not \"%a\"==\"" + myPid + "\" taskkill /F /PID %a",
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                var p = Process.Start(psi);
-                if (p != null) p.WaitForExit(1500);
+                    try
+                    {
+                        if (p.Id != cur.Id)
+                        {
+                            p.Kill();
+                        }
+                    }
+                    catch { }
+                }
             }
             catch { }
         }
@@ -209,7 +206,7 @@ namespace LanMediaController
                 {
                     if (stream != null)
                     {
-                        using (var fs = new FileStream(tempBridge, FileMode.Create, FileAccess.Write))
+                        using (var fs = new FileStream(tempBridge, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
                         {
                             stream.CopyTo(fs);
                         }
@@ -221,7 +218,7 @@ namespace LanMediaController
 
         private static void StartWinBridgeProcess()
         {
-            ThreadPool.QueueUserWorkItem(_ =>
+            var t = new Thread(() =>
             {
                 try
                 {
@@ -264,6 +261,8 @@ namespace LanMediaController
                 }
                 catch { }
             });
+            t.IsBackground = true;
+            t.Start();
         }
 
         private static void SendToWinBridge(string action, double pos)
@@ -402,12 +401,38 @@ namespace LanMediaController
         // ============================================================================
         private static void StartHttpServer()
         {
-            ThreadPool.QueueUserWorkItem(_ =>
+            int[] candidatePorts = new int[] { 8889, 9889, 18889, 17889, 0 };
+            bool bound = false;
+            foreach (int p in candidatePorts)
             {
                 try
                 {
-                    HttpTcpServer = new TcpListener(IPAddress.Any, HTTP_PORT);
-                    HttpTcpServer.Start();
+                    var srv = new TcpListener(IPAddress.Any, p);
+                    srv.Start();
+                    HttpTcpServer = srv;
+                    HTTP_PORT = ((IPEndPoint)srv.LocalEndpoint).Port;
+                    bound = true;
+                    break;
+                }
+                catch { }
+            }
+            if (!bound)
+            {
+                try
+                {
+                    var srv = new TcpListener(IPAddress.Loopback, 0);
+                    srv.Start();
+                    HttpTcpServer = srv;
+                    HTTP_PORT = ((IPEndPoint)srv.LocalEndpoint).Port;
+                    bound = true;
+                }
+                catch { return; }
+            }
+
+            var t = new Thread(() =>
+            {
+                try
+                {
                     while (Running)
                     {
                         var client = HttpTcpServer.AcceptTcpClient();
@@ -416,6 +441,8 @@ namespace LanMediaController
                 }
                 catch { }
             });
+            t.IsBackground = true;
+            t.Start();
         }
 
         private static void HandleHttpClient(object obj)
@@ -832,34 +859,9 @@ namespace LanMediaController
             catch { }
         }
 
-        private static void ScanSubnetPeers()
-        {
-            ThreadPool.QueueUserWorkItem(_ =>
-            {
-                try
-                {
-                    List<string> bcasts;
-                    string primaryIp = GetPrimaryLanIp(out bcasts);
-                    string[] parts = primaryIp.Split('.');
-                    if (parts.Length != 4 || primaryIp == "127.0.0.1") return;
-                    string prefix = parts[0] + "." + parts[1] + "." + parts[2] + ".";
-                    int selfLast = int.Parse(parts[3]);
-
-                    for (int i = 1; i <= 254; i++)
-                    {
-                        if (i == selfLast) continue;
-                        string targetIp = prefix + i;
-                        ThreadPool.QueueUserWorkItem(__ => SyncWithHttpPeer(targetIp));
-                        if (i % 25 == 0) Thread.Sleep(40);
-                    }
-                }
-                catch { }
-            });
-        }
-
         private static void StartUdpServer()
         {
-            ThreadPool.QueueUserWorkItem(_ =>
+            var t = new Thread(() =>
             {
                 try
                 {
@@ -899,6 +901,8 @@ namespace LanMediaController
                 }
                 catch { }
             });
+            t.IsBackground = true;
+            t.Start();
         }
 
         private static void BroadcastUdpState()
@@ -965,14 +969,11 @@ namespace LanMediaController
 
         private static void StartBackgroundTimers()
         {
-            ScanSubnetPeers();
-            ThreadPool.QueueUserWorkItem(_ =>
+            var t = new Thread(() =>
             {
-                int tickCount = 0;
                 while (Running)
                 {
                     Thread.Sleep(1000);
-                    tickCount++;
                     foreach (var d in DevicesMap.Values)
                     {
                         if (d.player != null && d.player.isPlaying)
@@ -990,9 +991,10 @@ namespace LanMediaController
                     }
                     catch { }
                     BroadcastUdpState();
-                    if (tickCount % 8 == 0) ScanSubnetPeers();
                 }
             });
+            t.IsBackground = true;
+            t.Start();
         }
 
         private static void OpenControlWindow()
@@ -1006,16 +1008,24 @@ namespace LanMediaController
             {
                 if (File.Exists(p))
                 {
-                    Process.Start(new ProcessStartInfo
+                    try
                     {
-                        FileName = p,
-                        Arguments = "--app=" + url + " --window-size=500,800",
-                        UseShellExecute = false
-                    });
-                    return;
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = p,
+                            Arguments = "--app=" + url + " --window-size=520,780",
+                            UseShellExecute = true
+                        });
+                        return;
+                    }
+                    catch { }
                 }
             }
-            Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+            try
+            {
+                Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+            }
+            catch { }
         }
 
         private static void ShutdownApp()
