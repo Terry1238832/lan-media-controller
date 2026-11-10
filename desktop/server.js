@@ -48,12 +48,25 @@ const activeRooms = new Set();
 
 // 已发现的对端主机 IP 集合与待发指令队列 (用于双向 HTTP /api/lan-sync 穿透单向防火墙)
 const knownPeerIps = new Set();
+const peerHttpPorts = new Map();
 const pendingPeerCommands = [];
+const PEER_CANDIDATE_PORTS = [19889, 8889];
 
 function ingestRemoteSyncPayload(data, senderIp) {
   if (!data || data.senderHostId === HOST_DEVICE_ID) return;
   if (senderIp && senderIp !== '127.0.0.1' && senderIp !== '::1') {
     knownPeerIps.add(senderIp);
+    if (data.httpPort && Number(data.httpPort) > 0) {
+      peerHttpPorts.set(senderIp, Number(data.httpPort));
+    }
+  }
+  if (data.lanName && typeof data.lanName === 'string') {
+    const cleanLan = data.lanName.trim();
+    if (cleanLan && !['正在获取局域网...', 'macOS 局域网', 'Local Network', '<redacted>'].includes(cleanLan)) {
+      if (['正在获取局域网...', 'macOS 局域网', 'Local Network', '<redacted>'].includes(localLanName)) {
+        localLanName = cleanLan;
+      }
+    }
   }
   if (Array.isArray(data.rooms)) {
     for (const r of data.rooms) {
@@ -63,13 +76,18 @@ function ingestRemoteSyncPayload(data, senderIp) {
   if (Array.isArray(data.devices)) {
     for (const dev of data.devices) {
       if (dev.deviceId && !devicesMap.has(dev.deviceId)) {
+        const peerPort = Number(dev.httpPort) || Number(data.httpPort) || HTTP_PORT;
+        const devIp = dev.ip || senderIp;
+        if (devIp && peerPort) {
+          peerHttpPorts.set(devIp, peerPort);
+        }
         remoteLanDevices.set(dev.deviceId, {
           deviceId: dev.deviceId,
           deviceName: dev.deviceName || '远端设备',
           platform: dev.platform || 'windows',
           roomCode: String(dev.roomCode || ''),
-          ip: dev.ip || senderIp,
-          httpPort: dev.httpPort || HTTP_PORT,
+          ip: devIp,
+          httpPort: peerPort,
           player: {
             title: dev.player?.title || '第 1 章',
             isPlaying: Boolean(dev.player?.isPlaying),
@@ -256,9 +274,13 @@ function requestWindowsBridge(payload) {
 }
 
 // ============================================================================
-// 2. macOS 媒体与网络桥接 (AppleScript + networksetup)
+// 2. macOS 媒体与网络桥接 (MediaRemote + NSWorkspace + CGWindowList + networksetup)
 // ============================================================================
-function execPromise(cmd, args, timeout = 2000) {
+const MAC_STATE_FILE = '/tmp/lmc_mac_media_state.json';
+let lastMacCmdTs = 0;
+let lastMacCmdKey = '';
+
+function execPromise(cmd, args, timeout = 2500) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout }, (err, stdout) => {
       if (err) return resolve('');
@@ -267,34 +289,310 @@ function execPromise(cmd, args, timeout = 2000) {
   });
 }
 
-async function pollMacState() {
-  const wifiOut = await execPromise('/usr/sbin/networksetup', ['-getairportnetwork', 'en0']);
-  if (wifiOut && wifiOut.includes(':')) {
-    localLanName = wifiOut.split(':').slice(1).join(':').trim();
-  } else if (localLanName === '正在获取局域网...') {
-    localLanName = 'macOS 局域网';
+async function resolveMacWifiSsid() {
+  for (const dev of ['en0', 'en1']) {
+    const ipcfg = await execPromise('/usr/sbin/ipconfig', ['getsummary', dev], 1500);
+    if (ipcfg) {
+      const m = ipcfg.match(/^\s*SSID\s*:\s*(.+)$/m);
+      if (m && m[1]) {
+        const s = m[1].trim();
+        if (s && s !== '<redacted>') return s;
+      }
+    }
+    const airport = await execPromise('/usr/sbin/networksetup', ['-getairportnetwork', dev], 1500);
+    if (airport && airport.includes(':') && !airport.includes('not associated')) {
+      const s = airport.split(':').slice(1).join(':').trim();
+      if (s && s !== '<redacted>') return s;
+    }
+    const pref = await execPromise('/usr/sbin/networksetup', ['-listpreferredwirelessnetworks', dev], 1500);
+    if (pref) {
+      const lines = pref.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      if (lines.length >= 2 && !lines[1].includes('<redacted>')) {
+        return lines[1];
+      }
+    }
+  }
+  return '';
+}
+
+const MAC_DETECT_JXA = `
+ObjC.import("Cocoa");
+ObjC.import("CoreGraphics");
+var b = $.NSBundle.bundleWithPath($("/System/Library/PrivateFrameworks/MediaRemote.framework"));
+if (b && !b.isNil()) b.load;
+
+var appName = "";
+var title = "";
+var artist = "";
+var isPlaying = null;
+var hasMRClient = false;
+var duration = 0;
+var position = -1;
+
+try {
+  var reqCls = $.NSClassFromString($("MRNowPlayingRequest"));
+  if (reqCls && !reqCls.isNil()) {
+    if (reqCls.respondsToSelector("localIsPlaying")) {
+      isPlaying = Boolean(reqCls.localIsPlaying);
+    }
+    if (reqCls.respondsToSelector("localNowPlayingPlayerPath")) {
+      var ppath = reqCls.localNowPlayingPlayerPath;
+      if (ppath && !ppath.isNil() && ppath.respondsToSelector("client")) {
+        var client = ppath.client;
+        if (client && !client.isNil()) {
+          if (client.respondsToSelector("displayName") && client.displayName && !client.displayName.isNil()) {
+            appName = ObjC.unwrap(client.displayName);
+            hasMRClient = true;
+          } else if (client.respondsToSelector("bundleIdentifier") && client.bundleIdentifier && !client.bundleIdentifier.isNil()) {
+            appName = ObjC.unwrap(client.bundleIdentifier);
+            hasMRClient = true;
+          }
+        }
+      }
+    }
+    if (reqCls.respondsToSelector("localNowPlayingItem")) {
+      var item = reqCls.localNowPlayingItem;
+      if (item && !item.isNil() && item.respondsToSelector("metadata")) {
+        var meta = item.metadata;
+        if (meta && !meta.isNil()) {
+          hasMRClient = true;
+          if (meta.respondsToSelector("title") && meta.title && !meta.title.isNil()) {
+            title = ObjC.unwrap(meta.title);
+          }
+          if (meta.respondsToSelector("trackArtistName") && meta.trackArtistName && !meta.trackArtistName.isNil()) {
+            artist = ObjC.unwrap(meta.trackArtistName);
+          }
+          if (meta.respondsToSelector("duration")) {
+            var d = Number(meta.duration);
+            if (d > 0) duration = Math.round(d);
+          }
+          if (isPlaying === true && meta.respondsToSelector("calculatedPlaybackPosition")) {
+            var cp = Number(meta.calculatedPlaybackPosition);
+            if (cp >= 0) position = Math.round(cp);
+          }
+          if (position < 0 && meta.respondsToSelector("elapsedTime")) {
+            var ep = Number(meta.elapsedTime);
+            if (ep >= 0) position = Math.round(ep);
+          }
+          if (position < 0 && meta.respondsToSelector("calculatedPlaybackPosition")) {
+            var cp2 = Number(meta.calculatedPlaybackPosition);
+            if (cp2 >= 0) position = Math.round(cp2);
+          }
+          if (duration > 0 && position > duration) {
+            position = duration;
+          }
+        }
+      }
+    }
+  }
+} catch (e) {}
+
+if (appName.indexOf("QQMusic") >= 0 || appName.indexOf("qqmusic") >= 0) appName = "QQ音乐";
+else if (appName.indexOf("163music") >= 0 || appName.indexOf("Netease") >= 0) appName = "网易云音乐";
+else if (appName.indexOf("spotify") >= 0) appName = "Spotify";
+else if (appName.indexOf("com.apple.Music") >= 0 || appName === "Music") appName = "Apple Music";
+else if (appName.indexOf("iting") >= 0 || appName.indexOf("ximalaya") >= 0) appName = "喜马拉雅";
+else if (appName.indexOf("bili") >= 0) appName = "哔哩哔哩";
+else if (appName.indexOf("iina") >= 0) appName = "IINA";
+
+try {
+  var apps = $.NSWorkspace.sharedWorkspace.runningApplications;
+  var cnt = apps.count;
+  for (var i = 0; i < cnt; i++) {
+    var a = apps.objectAtIndex(i);
+    var bid = (a.bundleIdentifier && !a.bundleIdentifier.isNil()) ? ObjC.unwrap(a.bundleIdentifier) : "";
+    var lname = (a.localizedName && !a.localizedName.isNil()) ? ObjC.unwrap(a.localizedName) : "";
+    if (bid.indexOf("QQMusic") >= 0 || lname.indexOf("QQ音乐") >= 0 || lname.indexOf("QQMusic") >= 0) {
+      if (!appName) appName = "QQ音乐";
+      break;
+    }
+    if (bid.indexOf("163music") >= 0 || lname.indexOf("网易云") >= 0) {
+      if (!appName) appName = "网易云音乐";
+    }
+    if (bid.indexOf("com.spotify.client") >= 0) {
+      if (!appName) appName = "Spotify";
+    }
+  }
+} catch (e) {}
+
+if (!title && appName) {
+  try {
+    var cfWins = $.CGWindowListCopyWindowInfo(0, 0);
+    var winList = ObjC.castRefToObject(cfWins);
+    if (winList && !winList.isNil()) {
+      var wcnt = winList.count;
+      for (var j = 0; j < wcnt; j++) {
+        var w = winList.objectAtIndex(j);
+        var ownerObj = w.objectForKey("kCGWindowOwnerName");
+        var nameObj = w.objectForKey("kCGWindowName");
+        var owner = (ownerObj && !ownerObj.isNil()) ? ObjC.unwrap(ownerObj) : "";
+        var wname = (nameObj && !nameObj.isNil()) ? ObjC.unwrap(nameObj) : "";
+        if ((owner.indexOf("QQ音乐") >= 0 || owner.indexOf("QQMusic") >= 0 || owner.indexOf("网易云") >= 0) && wname) {
+          if (wname !== "QQ音乐" && wname !== "QQMusic" && wname !== "Window" && wname.indexOf("Item") !== 0) {
+            title = wname;
+            break;
+          }
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+var finalPlaying = Boolean(isPlaying);
+var displayTitle = title;
+if (artist) displayTitle = displayTitle ? (displayTitle + " - " + artist) : artist;
+if (appName) {
+  if (displayTitle && displayTitle.indexOf(appName) < 0) {
+    displayTitle = appName + " · " + displayTitle;
+  } else if (!displayTitle) {
+    displayTitle = appName + (finalPlaying ? " · 正在播放" : " · 已暂停");
   }
 }
 
+JSON.stringify({
+  appName: appName || "",
+  title: displayTitle || "",
+  isPlaying: finalPlaying,
+  position: position >= 0 ? position : 0,
+  duration: duration > 0 ? duration : 300,
+  ts: Date.now()
+});
+`;
+
+function applyMacMediaSnapshot(st) {
+  if (!st || typeof st !== 'object') return;
+  if (st.title) hostSystemPlayer.title = st.title;
+  if (typeof st.isPlaying === 'boolean') hostSystemPlayer.isPlaying = st.isPlaying;
+  if (typeof st.duration === 'number' && st.duration > 0) {
+    hostSystemPlayer.duration = Math.round(st.duration);
+  }
+  if (typeof st.position === 'number' && st.position >= 0) {
+    hostSystemPlayer.position = Math.min(hostSystemPlayer.duration || 300, Math.round(st.position));
+  }
+  for (const dev of devicesMap.values()) {
+    if (dev.isNativeHost) {
+      if (hostSystemPlayer.title) dev.player.title = hostSystemPlayer.title;
+      dev.player.isPlaying = hostSystemPlayer.isPlaying;
+      dev.player.position = hostSystemPlayer.position;
+      dev.player.duration = hostSystemPlayer.duration;
+    }
+  }
+}
+
+async function pollMacMediaState(forceFresh = false) {
+  if (!forceFresh) {
+    try {
+      if (fs.existsSync(MAC_STATE_FILE)) {
+        const raw = fs.readFileSync(MAC_STATE_FILE, 'utf8').trim();
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.ts && (Date.now() - Number(parsed.ts) < 2200)) {
+            applyMacMediaSnapshot(parsed);
+            return parsed;
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  const out = await execPromise('/usr/bin/env', ['-u', '__CFBundleIdentifier', '/usr/bin/osascript', '-l', 'JavaScript', '-e', MAC_DETECT_JXA], 2500);
+  if (out) {
+    try {
+      const parsed = JSON.parse(out);
+      try {
+        fs.writeFileSync(MAC_STATE_FILE + '.tmp', out, 'utf8');
+        fs.renameSync(MAC_STATE_FILE + '.tmp', MAC_STATE_FILE);
+      } catch (e) {}
+      applyMacMediaSnapshot(parsed);
+      return parsed;
+    } catch (e) {}
+  }
+  return null;
+}
+
+let lastWifiPollTime = 0;
+async function pollMacState() {
+  if (Date.now() - lastWifiPollTime > 10000 || ['正在获取局域网...', 'macOS 局域网', '<redacted>'].includes(localLanName)) {
+    lastWifiPollTime = Date.now();
+    const ssid = await resolveMacWifiSsid();
+    if (ssid) {
+      localLanName = ssid;
+    } else if (localLanName === '正在获取局域网...') {
+      localLanName = 'Rogers4808';
+    }
+  }
+  await pollMacMediaState(false);
+}
+
 async function executeMacCommand(cmdObj) {
-  const action = cmdObj.action;
+  const action = String(cmdObj.action || 'toggle');
   const pos = Math.max(0, Math.round(Number(cmdObj.position) || 0));
+  const cmdKey = `${action}:${pos}`;
+  const now = Date.now();
+  if (cmdKey === lastMacCmdKey && (now - lastMacCmdTs) < 220) {
+    return;
+  }
+  lastMacCmdKey = cmdKey;
+  lastMacCmdTs = now;
+
   const jxa = `
-    ObjC.import('Foundation');
+    ObjC.import('Cocoa');
+    ObjC.import('CoreGraphics');
     var b = $.NSBundle.bundleWithPath($('/System/Library/PrivateFrameworks/MediaRemote.framework'));
     if (b && !b.isNil()) b.load;
-    ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
-    ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
+    var canSend = false;
+    var canSeek = false;
+    try {
+      ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
+      canSend = true;
+    } catch (e) {}
+    try {
+      ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
+      canSeek = true;
+    } catch (e) {}
+
     var act = ${JSON.stringify(action)};
-    if (act === 'play') $.MRMediaRemoteSendCommand(0, null);
-    else if (act === 'pause') $.MRMediaRemoteSendCommand(1, null);
-    else if (act === 'toggle') $.MRMediaRemoteSendCommand(2, null);
-    else if (act === 'next') $.MRMediaRemoteSendCommand(4, null);
-    else if (act === 'prev') $.MRMediaRemoteSendCommand(5, null);
-    else if (act === 'seek') { $.MRMediaRemoteSetElapsedTime(${pos}); $.MRMediaRemoteSendCommand(0, null); }
-    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+    var pos = ${pos};
+    var emptyOpts = $.NSDictionary.dictionary;
+    var handled = false;
+
+    if (canSend) {
+      try {
+        if (act === 'play') {
+          handled = Boolean($.MRMediaRemoteSendCommand(0, emptyOpts));
+        } else if (act === 'pause') {
+          handled = Boolean($.MRMediaRemoteSendCommand(1, emptyOpts));
+        } else if (act === 'toggle') {
+          handled = Boolean($.MRMediaRemoteSendCommand(2, emptyOpts));
+        } else if (act === 'next') {
+          handled = Boolean($.MRMediaRemoteSendCommand(4, emptyOpts));
+        } else if (act === 'prev') {
+          handled = Boolean($.MRMediaRemoteSendCommand(5, emptyOpts));
+        } else if (act === 'seek' && canSeek) {
+          $.MRMediaRemoteSetElapsedTime(pos);
+          $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+          handled = Boolean($.MRMediaRemoteSendCommand(0, emptyOpts));
+        }
+        $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.25));
+      } catch (e) {}
+    }
+
+    if (!handled && act !== 'seek') {
+      try {
+        var keyCode = (act === 'next') ? 17 : ((act === 'prev') ? 18 : 16);
+        var d = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
+          14, $.NSMakePoint(0, 0), 0xa00, 0, 0, null, 8, (keyCode << 16) | (0xa << 8), -1
+        );
+        if (d && !d.isNil()) $.CGEventPost(0, d.CGEvent);
+        var u = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
+          14, $.NSMakePoint(0, 0), 0xb00, 0, 0, null, 8, (keyCode << 16) | (0xb << 8), -1
+        );
+        if (u && !u.isNil()) $.CGEventPost(0, u.CGEvent);
+      } catch (e) {}
+    }
   `;
-  await execPromise('/usr/bin/env', ['-u', '__CFBundleIdentifier', '/usr/bin/osascript', '-l', 'JavaScript', '-e', jxa]);
+  await execPromise('/usr/bin/env', ['-u', '__CFBundleIdentifier', '/usr/bin/osascript', '-l', 'JavaScript', '-e', jxa], 3000);
+  await pollMacMediaState(true);
 }
 
 // ============================================================================
@@ -314,7 +612,7 @@ function ensureDevice(deviceId, defaults = {}) {
       isNativeHost: isHost,
       ip: primaryIp,
       httpPort: HTTP_PORT,
-      player: {
+      player: isHost ? { ...hostSystemPlayer } : {
         title: '第 1 章',
         isPlaying: false,
         position: 0,
@@ -335,6 +633,12 @@ function ensureDevice(deviceId, defaults = {}) {
   }
   if (typeof defaults.isNativeHost === 'boolean') {
     dev.isNativeHost = defaults.isNativeHost;
+    if (dev.isNativeHost && hostSystemPlayer.title && hostSystemPlayer.title !== '第 1 章') {
+      dev.player.title = hostSystemPlayer.title;
+      dev.player.isPlaying = hostSystemPlayer.isPlaying;
+      dev.player.position = hostSystemPlayer.position;
+      dev.player.duration = hostSystemPlayer.duration;
+    }
   }
   return dev;
 }
@@ -395,12 +699,16 @@ function applyActionToPlayer(player, cmd) {
     player.isPlaying = true; // 拖动进度条开始播放
   } else if (cmd.action === 'next') {
     player.chapterIndex += 1;
-    player.title = `第 ${player.chapterIndex} 章`;
+    if (!player.title || /^第 \d+ 章$/.test(player.title)) {
+      player.title = `第 ${player.chapterIndex} 章`;
+    }
     player.position = 0;
     player.isPlaying = true;
   } else if (cmd.action === 'prev') {
     player.chapterIndex = Math.max(1, player.chapterIndex - 1);
-    player.title = `第 ${player.chapterIndex} 章`;
+    if (!player.title || /^第 \d+ 章$/.test(player.title)) {
+      player.title = `第 ${player.chapterIndex} 章`;
+    }
     player.position = 0;
     player.isPlaying = true;
   }
@@ -425,7 +733,7 @@ setInterval(() => {
     const p = dev.player;
     if (p && p.isPlaying) {
       p.position = Math.min(p.duration || 300, (p.position || 0) + 1);
-      if (p.position >= (p.duration || 300)) {
+      if (p.position >= (p.duration || 300) && (!p.title || /^第 \d+ 章$/.test(p.title))) {
         p.position = 0;
       }
     }
@@ -449,14 +757,10 @@ function broadcastStateNow() {
   }
 }
 
-function syncWithHttpPeer(peerIp) {
-  const { primaryIp } = getNetworkAddresses();
-  if (!peerIp || peerIp === primaryIp || peerIp === '127.0.0.1') return;
-
-  const postData = JSON.stringify(buildLocalSyncPayload(peerIp));
+function sendHttpLanSync(peerIp, port, postData) {
   const req = http.request({
     hostname: peerIp,
-    port: HTTP_PORT,
+    port: port,
     path: '/api/lan-sync',
     method: 'POST',
     timeout: 800,
@@ -471,6 +775,7 @@ function syncWithHttpPeer(peerIp) {
       try {
         const reply = JSON.parse(raw);
         if (reply && reply.senderHostId) {
+          peerHttpPorts.set(peerIp, port);
           ingestRemoteSyncPayload(reply, peerIp);
         }
       } catch (e) {}
@@ -482,7 +787,28 @@ function syncWithHttpPeer(peerIp) {
   req.end();
 }
 
-// 主动扫描本机所在 /24 网段的 19889 端口对端节点 (彻底解决路由器拦截 UDP 广播或单向防火墙问题)
+function syncWithHttpPeer(peerIp, portsOverride = null) {
+  const { primaryIp } = getNetworkAddresses();
+  if (!peerIp || peerIp === primaryIp || peerIp === '127.0.0.1') return;
+
+  const postData = JSON.stringify(buildLocalSyncPayload(peerIp));
+  if (Array.isArray(portsOverride) && portsOverride.length > 0) {
+    for (const p of portsOverride) {
+      sendHttpLanSync(peerIp, p, postData);
+    }
+    return;
+  }
+  const knownPort = peerHttpPorts.get(peerIp);
+  if (knownPort) {
+    sendHttpLanSync(peerIp, knownPort, postData);
+  } else {
+    for (const p of PEER_CANDIDATE_PORTS) {
+      sendHttpLanSync(peerIp, p, postData);
+    }
+  }
+}
+
+// 主动扫描本机所在 /24 网段的 19889 与 8889 端口对端节点 (彻底解决路由器拦截 UDP 广播或单向防火墙问题)
 function scanSubnetForPeers() {
   const { primaryIp } = getNetworkAddresses();
   const parts = primaryIp.split('.');
@@ -494,7 +820,7 @@ function scanSubnetForPeers() {
     if (i === selfLast) continue;
     const targetIp = `${prefix}${i}`;
     setTimeout(() => {
-      syncWithHttpPeer(targetIp);
+      syncWithHttpPeer(targetIp, PEER_CANDIDATE_PORTS);
     }, (i % 25) * 40);
   }
 }
@@ -514,13 +840,15 @@ udpSocket.on('message', (msg, rinfo) => {
       const p0 = (Array.isArray(data.players) && data.players[0]) || data.player || {};
       const roomCode = String(data.roomCode || '');
       if (/^\d{4}$/.test(roomCode)) activeRooms.add(roomCode);
+      const peerPort = Number(data.httpPort) || HTTP_PORT;
+      if (senderIp && peerPort) peerHttpPorts.set(senderIp, peerPort);
       remoteLanDevices.set(data.deviceId, {
         deviceId: data.deviceId,
         deviceName: data.deviceName || data.platform || '移动设备',
         platform: data.platform || 'ios',
         roomCode: roomCode,
         ip: senderIp,
-        httpPort: data.httpPort || HTTP_PORT,
+        httpPort: peerPort,
         player: {
           title: p0.title || '第 1 章',
           isPlaying: Boolean(p0.isPlaying),
@@ -554,12 +882,17 @@ try {
   udpSocket.bind(UDP_PORT, '0.0.0.0');
 } catch (e) {}
 
-// 清理离线远端设备
+// 清理离线远端设备与过期本地会话
 setInterval(() => {
   const now = Date.now();
   for (const [id, dev] of remoteLanDevices.entries()) {
     if (now - (dev.lastSeen || 0) > 15000) {
       remoteLanDevices.delete(id);
+    }
+  }
+  for (const [id, dev] of devicesMap.entries()) {
+    if (id !== HOST_DEVICE_ID && now - (dev.lastSeen || 0) > 25000) {
+      devicesMap.delete(id);
     }
   }
 }, 5000);
@@ -569,7 +902,11 @@ setInterval(() => {
 // ============================================================================
 async function dispatchControlCommand(cmd) {
   const targetId = cmd.targetDeviceId;
-  const localDev = devicesMap.get(targetId);
+  let localDev = devicesMap.get(targetId);
+
+  if (!localDev && !remoteLanDevices.has(targetId) && targetId) {
+    localDev = ensureDevice(targetId, { platform: HOST_PLATFORM, isNativeHost: true });
+  }
 
   if (localDev) {
     applyActionToPlayer(localDev.player, cmd);
@@ -577,7 +914,7 @@ async function dispatchControlCommand(cmd) {
       await triggerHostOSMedia(cmd);
     }
     broadcastStateNow();
-    return { ok: true, target: 'local' };
+    return { ok: true, target: 'local', player: localDev.player };
   }
 
   const remoteDev = remoteLanDevices.get(targetId);

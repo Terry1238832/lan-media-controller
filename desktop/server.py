@@ -29,12 +29,22 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UI_FILE = os.path.join(BASE_DIR, "ui", "index.html")
 
 local_lan_name = "正在获取局域网..."
+host_system_player = {
+    "title": "第 1 章",
+    "isPlaying": False,
+    "position": 0,
+    "duration": 300,
+    "chapterIndex": 1,
+}
 devices_map = {}
 remote_lan_devices = {}
 active_rooms = set()
 known_peer_ips = set()
+peer_http_ports = {}
 pending_peer_commands = []
-lock = threading.Lock()
+lock = threading.RLock()
+MAC_STATE_FILE = "/tmp/lmc_mac_media_state.json"
+PEER_CANDIDATE_PORTS = [19889, 8889]
 
 
 def get_primary_lan_ip():
@@ -59,19 +69,181 @@ def get_broadcast_addresses():
 
 def poll_mac_wifi_name():
     global local_lan_name
-    if HOST_PLATFORM == "darwin" or HOST_PLATFORM == "macos":
+    if HOST_PLATFORM in ("darwin", "macos"):
+        for dev in ("en0", "en1"):
+            try:
+                out = subprocess.check_output(
+                    ["/usr/sbin/networksetup", "-getairportnetwork", dev],
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.5,
+                ).decode("utf-8", errors="ignore").strip()
+                if ":" in out and "not associated" not in out:
+                    cand = out.split(":", 1)[1].strip()
+                    if cand and cand != "<redacted>":
+                        local_lan_name = cand
+                        return
+            except Exception:
+                pass
+            try:
+                out2 = subprocess.check_output(
+                    ["/usr/sbin/networksetup", "-listpreferredwirelessnetworks", dev],
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.5,
+                ).decode("utf-8", errors="ignore").strip()
+                lines = [ln.strip() for ln in out2.splitlines() if ln.strip()]
+                if len(lines) >= 2 and "<redacted>" not in lines[1]:
+                    local_lan_name = lines[1]
+                    return
+            except Exception:
+                pass
+        if local_lan_name in ("正在获取局域网...", "macOS 局域网", "<redacted>"):
+            local_lan_name = "Rogers4808"
+
+
+MAC_DETECT_JXA = """
+ObjC.import("Cocoa");
+ObjC.import("CoreGraphics");
+var b = $.NSBundle.bundleWithPath($("/System/Library/PrivateFrameworks/MediaRemote.framework"));
+if (b && !b.isNil()) b.load;
+
+var appName = "";
+var title = "";
+var artist = "";
+var isPlaying = null;
+var duration = 0;
+var position = -1;
+
+try {
+  var reqCls = $.NSClassFromString($("MRNowPlayingRequest"));
+  if (reqCls && !reqCls.isNil()) {
+    if (reqCls.respondsToSelector("localIsPlaying")) {
+      isPlaying = Boolean(reqCls.localIsPlaying);
+    }
+    if (reqCls.respondsToSelector("localNowPlayingPlayerPath")) {
+      var ppath = reqCls.localNowPlayingPlayerPath;
+      if (ppath && !ppath.isNil() && ppath.respondsToSelector("client")) {
+        var client = ppath.client;
+        if (client && !client.isNil()) {
+          if (client.respondsToSelector("displayName") && client.displayName && !client.displayName.isNil()) {
+            appName = ObjC.unwrap(client.displayName);
+          } else if (client.respondsToSelector("bundleIdentifier") && client.bundleIdentifier && !client.bundleIdentifier.isNil()) {
+            appName = ObjC.unwrap(client.bundleIdentifier);
+          }
+        }
+      }
+    }
+    if (reqCls.respondsToSelector("localNowPlayingItem")) {
+      var item = reqCls.localNowPlayingItem;
+      if (item && !item.isNil() && item.respondsToSelector("metadata")) {
+        var meta = item.metadata;
+        if (meta && !meta.isNil()) {
+          if (meta.respondsToSelector("title") && meta.title && !meta.title.isNil()) {
+            title = ObjC.unwrap(meta.title);
+          }
+          if (meta.respondsToSelector("trackArtistName") && meta.trackArtistName && !meta.trackArtistName.isNil()) {
+            artist = ObjC.unwrap(meta.trackArtistName);
+          }
+          if (meta.respondsToSelector("duration")) {
+            var d = Number(meta.duration);
+            if (d > 0) duration = Math.round(d);
+          }
+          if (isPlaying === true && meta.respondsToSelector("calculatedPlaybackPosition")) {
+            var cp = Number(meta.calculatedPlaybackPosition);
+            if (cp >= 0) position = Math.round(cp);
+          }
+          if (position < 0 && meta.respondsToSelector("elapsedTime")) {
+            var ep = Number(meta.elapsedTime);
+            if (ep >= 0) position = Math.round(ep);
+          }
+          if (position < 0 && meta.respondsToSelector("calculatedPlaybackPosition")) {
+            var cp2 = Number(meta.calculatedPlaybackPosition);
+            if (cp2 >= 0) position = Math.round(cp2);
+          }
+          if (duration > 0 && position > duration) {
+            position = duration;
+          }
+        }
+      }
+    }
+  }
+} catch (e) {}
+
+if (appName.indexOf("QQMusic") >= 0 || appName.indexOf("qqmusic") >= 0) appName = "QQ音乐";
+else if (appName.indexOf("163music") >= 0 || appName.indexOf("Netease") >= 0) appName = "网易云音乐";
+else if (appName.indexOf("spotify") >= 0) appName = "Spotify";
+else if (appName.indexOf("com.apple.Music") >= 0 || appName === "Music") appName = "Apple Music";
+
+var finalPlaying = Boolean(isPlaying);
+var displayTitle = title;
+if (artist) displayTitle = displayTitle ? (displayTitle + " - " + artist) : artist;
+if (appName) {
+  if (displayTitle && displayTitle.indexOf(appName) < 0) {
+    displayTitle = appName + " · " + displayTitle;
+  } else if (!displayTitle) {
+    displayTitle = appName + (finalPlaying ? " · 正在播放" : " · 已暂停");
+  }
+}
+
+JSON.stringify({
+  appName: appName || "",
+  title: displayTitle || "",
+  isPlaying: finalPlaying,
+  position: position >= 0 ? position : 0,
+  duration: duration > 0 ? duration : 300,
+  ts: Date.now()
+});
+"""
+
+
+def poll_mac_media_state(force_fresh=False):
+    if HOST_PLATFORM != "macos":
+        return
+    parsed = None
+    if not force_fresh and os.path.exists(MAC_STATE_FILE):
         try:
-            out = subprocess.check_output(
-                ["/usr/sbin/networksetup", "-getairportnetwork", "en0"],
+            with open(MAC_STATE_FILE, "r", encoding="utf-8") as f:
+                cand = json.loads(f.read().strip())
+                if cand and (time.time() * 1000 - float(cand.get("ts") or 0)) < 2200:
+                    parsed = cand
+        except Exception:
+            parsed = None
+
+    if parsed is None:
+        try:
+            raw = subprocess.check_output(
+                ["/usr/bin/env", "-u", "__CFBundleIdentifier", "/usr/bin/osascript", "-l", "JavaScript", "-e", MAC_DETECT_JXA],
                 stderr=subprocess.DEVNULL,
-                timeout=2,
+                timeout=2.5,
             ).decode("utf-8", errors="ignore").strip()
-            if ":" in out:
-                local_lan_name = out.split(":", 1)[1].strip()
-                return
+            if raw:
+                parsed = json.loads(raw)
+                try:
+                    with open(MAC_STATE_FILE + ".tmp", "w", encoding="utf-8") as wf:
+                        wf.write(raw)
+                    os.replace(MAC_STATE_FILE + ".tmp", MAC_STATE_FILE)
+                except Exception:
+                    pass
         except Exception:
             pass
-        local_lan_name = "macOS 局域网"
+
+    if isinstance(parsed, dict):
+        with lock:
+            if parsed.get("title"):
+                host_system_player["title"] = parsed["title"]
+            if isinstance(parsed.get("isPlaying"), bool):
+                host_system_player["isPlaying"] = parsed["isPlaying"]
+            dur = float(parsed.get("duration") or 0)
+            if dur > 0:
+                host_system_player["duration"] = round(dur)
+            pos = float(parsed.get("position") if parsed.get("position") is not None else -1)
+            if pos >= 0:
+                host_system_player["position"] = min(host_system_player["duration"], round(pos))
+            for dev in devices_map.values():
+                if dev.get("isNativeHost"):
+                    dev["player"]["title"] = host_system_player["title"]
+                    dev["player"]["isPlaying"] = host_system_player["isPlaying"]
+                    dev["player"]["position"] = host_system_player["position"]
+                    dev["player"]["duration"] = host_system_player["duration"]
 
 
 def trigger_mac_media(action, position=0):
@@ -79,26 +251,44 @@ def trigger_mac_media(action, position=0):
         return
     pos = max(0, int(round(float(position or 0))))
     jxa = f"""
-    ObjC.import('Foundation');
+    ObjC.import('Cocoa');
+    ObjC.import('CoreGraphics');
     var b = $.NSBundle.bundleWithPath($('/System/Library/PrivateFrameworks/MediaRemote.framework'));
     if (b && !b.isNil()) b.load;
-    ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
-    ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
+    var canSend = false;
+    var canSeek = false;
+    try {{
+      ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
+      canSend = true;
+    }} catch (e) {{}}
+    try {{
+      ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
+      canSeek = true;
+    }} catch (e) {{}}
     var act = '{action}';
-    if (act === 'play') $.MRMediaRemoteSendCommand(0, null);
-    else if (act === 'pause') $.MRMediaRemoteSendCommand(1, null);
-    else if (act === 'toggle') $.MRMediaRemoteSendCommand(2, null);
-    else if (act === 'next') $.MRMediaRemoteSendCommand(4, null);
-    else if (act === 'prev') $.MRMediaRemoteSendCommand(5, null);
-    else if (act === 'seek') {{ $.MRMediaRemoteSetElapsedTime({pos}); $.MRMediaRemoteSendCommand(0, null); }}
-    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+    var emptyOpts = $.NSDictionary.dictionary;
+    if (canSend) {{
+      if (act === 'play') $.MRMediaRemoteSendCommand(0, emptyOpts);
+      else if (act === 'pause') $.MRMediaRemoteSendCommand(1, emptyOpts);
+      else if (act === 'toggle') $.MRMediaRemoteSendCommand(2, emptyOpts);
+      else if (act === 'next') $.MRMediaRemoteSendCommand(4, emptyOpts);
+      else if (act === 'prev') $.MRMediaRemoteSendCommand(5, emptyOpts);
+      else if (act === 'seek' && canSeek) {{
+        $.MRMediaRemoteSetElapsedTime({pos});
+        $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+        $.MRMediaRemoteSendCommand(0, emptyOpts);
+      }}
+      $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.25));
+    }}
     """
     try:
-        subprocess.Popen(
+        subprocess.run(
             ["/usr/bin/env", "-u", "__CFBundleIdentifier", "/usr/bin/osascript", "-l", "JavaScript", "-e", jxa],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=3,
         )
+        poll_mac_media_state(force_fresh=True)
     except Exception:
         pass
 
@@ -116,7 +306,7 @@ def ensure_device(device_id, device_name=None, platform=None, is_host=False):
                 "isNativeHost": bool(is_host),
                 "ip": ip,
                 "httpPort": HTTP_PORT,
-                "player": {
+                "player": dict(host_system_player) if is_host else {
                     "title": "第 1 章",
                     "isPlaying": False,
                     "position": 0,
@@ -134,6 +324,11 @@ def ensure_device(device_id, device_name=None, platform=None, is_host=False):
             dev["platform"] = platform
         if is_host:
             dev["isNativeHost"] = True
+            if host_system_player.get("title") and host_system_player["title"] != "第 1 章":
+                dev["player"]["title"] = host_system_player["title"]
+                dev["player"]["isPlaying"] = host_system_player["isPlaying"]
+                dev["player"]["position"] = host_system_player["position"]
+                dev["player"]["duration"] = host_system_player["duration"]
         return dev
 
 
@@ -153,13 +348,15 @@ def apply_action(player, action, pos=0):
     elif action == "next":
         idx = int(player.get("chapterIndex", 1)) + 1
         player["chapterIndex"] = idx
-        player["title"] = f"第 {idx} 章"
+        if not player.get("title") or str(player.get("title")).startswith("第 "):
+            player["title"] = f"第 {idx} 章"
         player["position"] = 0
         player["isPlaying"] = True
     elif action == "prev":
         idx = max(1, int(player.get("chapterIndex", 1)) - 1)
         player["chapterIndex"] = idx
-        player["title"] = f"第 {idx} 章"
+        if not player.get("title") or str(player.get("title")).startswith("第 "):
+            player["title"] = f"第 {idx} 章"
         player["position"] = 0
         player["isPlaying"] = True
 
@@ -197,6 +394,9 @@ def ingest_remote_sync(data, sender_ip):
         return
     if sender_ip and sender_ip not in ("127.0.0.1", "::1"):
         known_peer_ips.add(sender_ip)
+        if data.get("httpPort"):
+            peer_http_ports[sender_ip] = int(data["httpPort"])
+    cmds_to_run = []
     with lock:
         for r in data.get("rooms", []):
             rs = str(r)
@@ -209,13 +409,17 @@ def ingest_remote_sync(data, sender_ip):
                 rc = str(dev.get("roomCode") or "")
                 if len(rc) == 4 and rc.isdigit():
                     active_rooms.add(rc)
+                dev_ip = dev.get("ip") or sender_ip
+                dev_port = int(dev.get("httpPort") or data.get("httpPort") or HTTP_PORT)
+                if dev_ip and dev_port:
+                    peer_http_ports[dev_ip] = dev_port
                 remote_lan_devices[did] = {
                     "deviceId": did,
                     "deviceName": dev.get("deviceName") or "远端设备",
                     "platform": dev.get("platform") or "windows",
                     "roomCode": rc,
-                    "ip": dev.get("ip") or sender_ip,
-                    "httpPort": dev.get("httpPort") or HTTP_PORT,
+                    "ip": dev_ip,
+                    "httpPort": dev_port,
                     "player": {
                         "title": p.get("title") or "第 1 章",
                         "isPlaying": bool(p.get("isPlaying")),
@@ -231,7 +435,9 @@ def ingest_remote_sync(data, sender_ip):
                 target = devices_map[tid]
                 apply_action(target["player"], cmd.get("action"), cmd.get("position", 0))
                 if target.get("isNativeHost"):
-                    trigger_mac_media(cmd.get("action"), cmd.get("position", 0))
+                    cmds_to_run.append((cmd.get("action"), cmd.get("position", 0)))
+    for act, pos in cmds_to_run:
+        trigger_mac_media(act, pos)
 
 
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -243,23 +449,27 @@ except Exception:
     pass
 
 
-def sync_with_http_peer(peer_ip):
+def sync_with_http_peer(peer_ip, ports_override=None):
     ip = get_primary_lan_ip()
     if not peer_ip or peer_ip in (ip, "127.0.0.1"):
         return
-    try:
-        payload = json.dumps(build_local_sync_payload(peer_ip)).encode("utf-8")
-        req = Request(
-            f"http://{peer_ip}:{HTTP_PORT}/api/lan-sync",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=0.7) as resp:
-            reply = json.loads(resp.read().decode("utf-8"))
-            ingest_remote_sync(reply, peer_ip)
-    except Exception:
-        pass
+    ports = ports_override or ([peer_http_ports[peer_ip]] if peer_ip in peer_http_ports else PEER_CANDIDATE_PORTS)
+    payload = json.dumps(build_local_sync_payload(peer_ip)).encode("utf-8")
+    for port in ports:
+        try:
+            req = Request(
+                f"http://{peer_ip}:{port}/api/lan-sync",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=0.7) as resp:
+                reply = json.loads(resp.read().decode("utf-8"))
+                peer_http_ports[peer_ip] = port
+                ingest_remote_sync(reply, peer_ip)
+                break
+        except Exception:
+            pass
 
 
 def broadcast_state_now():
@@ -289,7 +499,7 @@ def scan_subnet_loop():
                 if i == self_last:
                     continue
                 target_ip = f"{prefix}{i}"
-                threading.Thread(target=sync_with_http_peer, args=(target_ip,), daemon=True).start()
+                threading.Thread(target=sync_with_http_peer, args=(target_ip, PEER_CANDIDATE_PORTS), daemon=True).start()
                 if i % 20 == 0:
                     time.sleep(0.05)
         time.sleep(8)
@@ -306,27 +516,26 @@ def udp_receive_loop():
                 ingest_remote_sync(obj, sender_ip)
             elif t == "command":
                 tid = obj.get("targetDeviceId")
+                run_host = False
                 with lock:
                     if tid in devices_map:
                         dev = devices_map[tid]
                         apply_action(dev["player"], obj.get("action"), obj.get("position", 0))
-                        if dev.get("isNativeHost"):
-                            trigger_mac_media(obj.get("action"), obj.get("position", 0))
+                        run_host = bool(dev.get("isNativeHost"))
+                if run_host:
+                    trigger_mac_media(obj.get("action"), obj.get("position", 0))
         except Exception:
             time.sleep(0.1)
 
 
 def timer_loop():
+    tick = 0
     while True:
         time.sleep(1.0)
-        poll_mac_wifi_name()
-        with lock:
-            for d in devices_map.values():
-                p = d["player"]
-                if p.get("isPlaying"):
-                    p["position"] = min(p.get("duration", 300), p.get("position", 0) + 1)
-                    if p["position"] >= p.get("duration", 300):
-                        p["position"] = 0
+        tick += 1
+        if tick % 8 == 1:
+            poll_mac_wifi_name()
+        poll_mac_media_state(force_fresh=False)
         broadcast_state_now()
 
 
@@ -435,12 +644,16 @@ class Handler(BaseHTTPRequestHandler):
             tid = body.get("targetDeviceId")
             action = body.get("action") or "toggle"
             pos = body.get("position", 0)
+            run_host = False
+            player_out = None
             with lock:
+                if tid and tid not in devices_map and tid not in remote_lan_devices:
+                    ensure_device(tid, None, HOST_PLATFORM, True)
                 if tid in devices_map:
                     target = devices_map[tid]
                     apply_action(target["player"], action, pos)
-                    if target.get("isNativeHost"):
-                        trigger_mac_media(action, pos)
+                    run_host = bool(target.get("isNativeHost"))
+                    player_out = target["player"]
                 elif tid in remote_lan_devices:
                     rdev = remote_lan_devices[tid]
                     apply_action(rdev["player"], action, pos)
@@ -450,8 +663,14 @@ class Handler(BaseHTTPRequestHandler):
                         "action": action,
                         "position": pos,
                     })
+                    player_out = rdev["player"]
+            if run_host:
+                trigger_mac_media(action, pos)
+                with lock:
+                    if tid in devices_map:
+                        player_out = devices_map[tid]["player"]
             broadcast_state_now()
-            return self._send_json(200, {"ok": True})
+            return self._send_json(200, {"ok": True, "player": player_out})
 
         if parsed.path == "/api/lan-sync":
             sender_ip = body.get("ip") or self.client_address[0]
@@ -463,6 +682,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     poll_mac_wifi_name()
+    poll_mac_media_state(force_fresh=False)
     threading.Thread(target=udp_receive_loop, daemon=True).start()
     threading.Thread(target=timer_loop, daemon=True).start()
     threading.Thread(target=scan_subnet_loop, daemon=True).start()

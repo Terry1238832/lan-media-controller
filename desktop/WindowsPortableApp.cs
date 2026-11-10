@@ -431,14 +431,20 @@ namespace LanMediaController
             else if (action == "next")
             {
                 p.chapterIndex++;
-                p.title = "\u7b2c " + p.chapterIndex + " \u7ae0";
+                if (string.IsNullOrEmpty(p.title) || p.title.StartsWith("\u7b2c "))
+                {
+                    p.title = "\u7b2c " + p.chapterIndex + " \u7ae0";
+                }
                 p.position = 0;
                 p.isPlaying = true;
             }
             else if (action == "prev")
             {
                 p.chapterIndex = Math.Max(1, p.chapterIndex - 1);
-                p.title = "\u7b2c " + p.chapterIndex + " \u7ae0";
+                if (string.IsNullOrEmpty(p.title) || p.title.StartsWith("\u7b2c "))
+                {
+                    p.title = "\u7b2c " + p.chapterIndex + " \u7ae0";
+                }
                 p.position = 0;
                 p.isPlaying = true;
             }
@@ -796,6 +802,16 @@ namespace LanMediaController
                             rec.platform = d.ContainsKey("platform") ? Convert.ToString(d["platform"]) : "windows";
                             rec.roomCode = d.ContainsKey("roomCode") ? Convert.ToString(d["roomCode"]) : "";
                             rec.ip = d.ContainsKey("ip") && !string.IsNullOrEmpty(Convert.ToString(d["ip"])) ? Convert.ToString(d["ip"]) : senderIp;
+                            if (d.ContainsKey("httpPort") && d["httpPort"] != null)
+                            {
+                                int hp;
+                                if (int.TryParse(Convert.ToString(d["httpPort"]), out hp) && hp > 0) rec.httpPort = hp;
+                            }
+                            else if (dict.ContainsKey("httpPort") && dict["httpPort"] != null)
+                            {
+                                int hp2;
+                                if (int.TryParse(Convert.ToString(dict["httpPort"]), out hp2) && hp2 > 0) rec.httpPort = hp2;
+                            }
                             rec.lastSeen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                             if (!string.IsNullOrEmpty(rec.roomCode)) ActiveRooms[rec.roomCode] = true;
 
@@ -876,35 +892,39 @@ namespace LanMediaController
 
         private static void SyncWithHttpPeer(string peerIp)
         {
-            try
+            List<string> bcasts;
+            string primaryIp = GetPrimaryLanIp(out bcasts);
+            if (string.IsNullOrEmpty(peerIp) || peerIp == primaryIp || peerIp == "127.0.0.1") return;
+
+            byte[] payload = Encoding.UTF8.GetBytes(BuildLocalSyncJson(peerIp));
+            int[] portsToTry = new int[] { 19889, 8889 };
+            foreach (int targetPort in portsToTry)
             {
-                List<string> bcasts;
-                string primaryIp = GetPrimaryLanIp(out bcasts);
-                if (string.IsNullOrEmpty(peerIp) || peerIp == primaryIp || peerIp == "127.0.0.1") return;
-
-                var req = (HttpWebRequest)WebRequest.Create("http://" + peerIp + ":" + HTTP_PORT + "/api/lan-sync");
-                req.Method = "POST";
-                req.ContentType = "application/json";
-                req.Timeout = 700;
-                req.ReadWriteTimeout = 700;
-
-                byte[] payload = Encoding.UTF8.GetBytes(BuildLocalSyncJson(peerIp));
-                req.ContentLength = payload.Length;
-                using (var reqStream = req.GetRequestStream())
+                try
                 {
-                    reqStream.Write(payload, 0, payload.Length);
-                }
+                    var req = (HttpWebRequest)WebRequest.Create("http://" + peerIp + ":" + targetPort + "/api/lan-sync");
+                    req.Method = "POST";
+                    req.ContentType = "application/json";
+                    req.Timeout = 700;
+                    req.ReadWriteTimeout = 700;
+                    req.ContentLength = payload.Length;
+                    using (var reqStream = req.GetRequestStream())
+                    {
+                        reqStream.Write(payload, 0, payload.Length);
+                    }
 
-                using (var resp = (HttpWebResponse)req.GetResponse())
-                using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                {
-                    string replyJson = reader.ReadToEnd();
-                    var jss = new JavaScriptSerializer();
-                    var replyDict = jss.Deserialize<Dictionary<string, object>>(replyJson);
-                    IngestRemoteSyncPayload(replyDict, peerIp);
+                    using (var resp = (HttpWebResponse)req.GetResponse())
+                    using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    {
+                        string replyJson = reader.ReadToEnd();
+                        var jss = new JavaScriptSerializer();
+                        var replyDict = jss.Deserialize<Dictionary<string, object>>(replyJson);
+                        IngestRemoteSyncPayload(replyDict, peerIp);
+                        break;
+                    }
                 }
+                catch { }
             }
-            catch { }
         }
 
         private static void StartUdpServer()

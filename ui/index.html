@@ -573,14 +573,15 @@
       return 'windows';
     }
 
-    let myDeviceId = safeSessionGet('lan_ctrl_device_id');
+    let myDeviceId = window.__INITIAL_DEVICE_ID__ || safeSessionGet('lan_ctrl_device_id') || safeLocalGet('lan_ctrl_device_id');
     if (!myDeviceId) {
       myDeviceId = 'dev-' + Math.random().toString(36).slice(2, 10);
-      safeSessionSet('lan_ctrl_device_id', myDeviceId);
     }
+    safeSessionSet('lan_ctrl_device_id', myDeviceId);
+    safeLocalSet('lan_ctrl_device_id', myDeviceId);
 
-    let myPlatform = safeSessionGet('lan_ctrl_platform') || detectDefaultPlatform();
-    let myDeviceName = safeSessionGet('lan_ctrl_device_name') || `${PLATFORM_LABELS[myPlatform]} 设备`;
+    let myPlatform = window.__INITIAL_PLATFORM__ || safeSessionGet('lan_ctrl_platform') || safeLocalGet('lan_ctrl_platform') || detectDefaultPlatform();
+    let myDeviceName = safeSessionGet('lan_ctrl_device_name') || safeLocalGet('lan_ctrl_device_name') || `${PLATFORM_LABELS[myPlatform]} 设备`;
     let currentRoomCode = '';
 
     // 局域网名称同步缓存（当本机处于受限环境时自动从同网络对端同步真实 Wi-Fi 名称）
@@ -712,11 +713,17 @@
     let roomEventSource = null;
     let activeSubscribedRoom = '';
     let lastJoinReplyTime = 0;
+    let relayBackoffUntil = 0;
 
     function publishRelayMessage(topic, obj) {
+      if (Date.now() < relayBackoffUntil) return;
       fetch(`${RELAY_BASE}/${topic}`, {
         method: 'POST',
         body: JSON.stringify(obj)
+      }).then(res => {
+        if (res && res.status === 429) {
+          relayBackoffUntil = Date.now() + 60000;
+        }
       }).catch(() => {});
     }
 
@@ -735,6 +742,10 @@
     function processLobbyMessage(rawLine) {
       try {
         const outer = JSON.parse(rawLine);
+        if (outer && outer.http === 429) {
+          relayBackoffUntil = Date.now() + 60000;
+          return;
+        }
         if (!outer || outer.event !== 'message' || !outer.message) return;
         const msg = JSON.parse(outer.message);
         if (msg.lanName) updateResolvedLanName(msg.lanName);
@@ -746,8 +757,13 @@
     }
 
     async function pollTopicSnapshot(topic, handlerFn) {
+      if (Date.now() < relayBackoffUntil) return;
       try {
         const res = await fetch(`${RELAY_BASE}/${topic}/json?poll=1&since=2h`);
+        if (res.status === 429) {
+          relayBackoffUntil = Date.now() + 60000;
+          return;
+        }
         const text = await res.text();
         const lines = text.split('\n');
         for (const line of lines) {
@@ -763,23 +779,6 @@
         lobbyEventSource = new EventSource(`${RELAY_BASE}/${LOBBY_TOPIC}/sse?since=2h`);
         lobbyEventSource.onmessage = (ev) => processLobbyMessage(ev.data);
       } catch (e) {}
-
-      if (window.__MAC_BRIDGE_TOPIC__) {
-        const macTopic = String(window.__MAC_BRIDGE_TOPIC__).trim();
-        const processMacBridgeLine = (rawLine) => {
-          try {
-            const outer = JSON.parse(rawLine);
-            if (!outer || outer.event !== 'message' || !outer.message) return;
-            const st = JSON.parse(outer.message);
-            if (st && window.__onNativeMediaState) window.__onNativeMediaState(st);
-          } catch (e) {}
-        };
-        pollTopicSnapshot(macTopic, processMacBridgeLine);
-        try {
-          const macEs = new EventSource(`${RELAY_BASE}/${macTopic}/sse?since=10m`);
-          macEs.onmessage = (ev) => processMacBridgeLine(ev.data);
-        } catch (e) {}
-      }
     }
 
     function broadcastMyRoomPresence(isNewJoin = false) {
@@ -845,12 +844,21 @@
 
           if (msg.targetDeviceId === myDeviceId) {
             applyLocalAction(selfPlayer, msg.action, msg.position);
-            triggerMacNativeBridge(msg.action, msg.position);
             apiFetch('/api/control', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ targetDeviceId: myDeviceId, action: msg.action, position: msg.position })
-            }).catch(() => {});
+            }).then(r => r.json()).then(d => {
+              if (d && d.player) {
+                if (d.player.title) selfPlayer.title = d.player.title;
+                if (typeof d.player.isPlaying === 'boolean') selfPlayer.isPlaying = d.player.isPlaying;
+                if (typeof d.player.position === 'number') selfPlayer.position = Math.round(d.player.position);
+                if (typeof d.player.duration === 'number' && d.player.duration > 0) selfPlayer.duration = Math.round(d.player.duration);
+                renderUI();
+              }
+            }).catch(() => {
+              triggerMacNativeBridge(msg.action, msg.position);
+            });
             broadcastMyRoomPresence(false);
             renderUI();
           } else if (roomPeersMap.has(msg.targetDeviceId)) {
@@ -921,7 +929,10 @@
       if (val) {
         myDeviceName = val;
         safeSessionSet('lan_ctrl_device_name', myDeviceName);
+        safeLocalSet('lan_ctrl_device_name', myDeviceName);
       }
+      safeSessionSet('lan_ctrl_platform', myPlatform);
+      safeLocalSet('lan_ctrl_platform', myPlatform);
       try {
         await apiFetch('/api/device/update', {
           method: 'POST',
@@ -1049,7 +1060,6 @@
 
       if (targetDeviceId === myDeviceId) {
         applyLocalAction(selfPlayer, resolvedAction, position);
-        triggerMacNativeBridge(resolvedAction, position);
         broadcastMyRoomPresence(false);
       } else {
         if (roomPeersMap.has(targetDeviceId)) {
@@ -1072,12 +1082,29 @@
       renderUI();
 
       try {
-        await apiFetch('/api/control', {
+        const res = await apiFetch('/api/control', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ targetDeviceId, action: resolvedAction, position })
         });
-      } catch (e) {}
+        const data = await res.json();
+        if (targetDeviceId === myDeviceId && data && data.player) {
+          if (data.player.title) selfPlayer.title = data.player.title;
+          if (typeof data.player.isPlaying === 'boolean') selfPlayer.isPlaying = data.player.isPlaying;
+          if (typeof data.player.position === 'number' && !draggingState.has(myDeviceId)) {
+            selfPlayer.position = Math.round(data.player.position);
+          }
+          if (typeof data.player.duration === 'number' && data.player.duration > 0) {
+            selfPlayer.duration = Math.round(data.player.duration);
+          }
+          renderUI();
+          if (currentRoomCode) broadcastMyRoomPresence(false);
+        }
+      } catch (e) {
+        if (targetDeviceId === myDeviceId) {
+          triggerMacNativeBridge(resolvedAction, position);
+        }
+      }
     }
 
     function getCombinedRoomDevices() {
@@ -1262,14 +1289,18 @@
 
         if (data.selfDevice && data.selfDevice.player) {
           const sp = data.selfDevice.player;
-          const inGrace = (Date.now() - lastManualCmdTime) < 2200;
+          const inGrace = (Date.now() - lastManualCmdTime) < 1200;
           const changed = (sp.title && sp.title !== selfPlayer.title) || (!inGrace && sp.isPlaying !== selfPlayer.isPlaying);
           if (sp.title) selfPlayer.title = sp.title;
+          if (typeof sp.duration === 'number' && sp.duration > 0) {
+            selfPlayer.duration = Math.round(sp.duration);
+          }
           if (!inGrace) {
             selfPlayer.isPlaying = Boolean(sp.isPlaying);
-            selfPlayer.position = Number(sp.position) || 0;
+            if (!draggingState.has(myDeviceId)) {
+              selfPlayer.position = Math.min(selfPlayer.duration, Math.max(0, Math.round(Number(sp.position) || 0)));
+            }
           }
-          selfPlayer.duration = Number(sp.duration) || 300;
           if (data.selfDevice.roomCode && !currentRoomCode) {
             currentRoomCode = data.selfDevice.roomCode;
             connectRoomRelay(currentRoomCode);
@@ -1311,14 +1342,14 @@
       renderUI();
     }, 1000);
 
-    // 轮询兜底同步（轻量 GET 快照，确保即使 SSE 受网络代理缓冲也能在 2 秒内互见）
+    // 低频兜底同步（避免触发 ntfy 429 速率限制）
     setInterval(() => {
       if (currentRoomCode) {
         pollTopicSnapshot(`lmc_sync_room_v3_${currentRoomCode}`, processRoomMessage);
       } else if (!resolvedLanName) {
         pollTopicSnapshot(LOBBY_TOPIC, processLobbyMessage);
       }
-    }, 2800);
+    }, 18000);
 
     // 低频心跳保活（避免触发 POST 速率限制）
     setInterval(() => {
@@ -1326,7 +1357,7 @@
     }, 25000);
 
     fetchState();
-    setInterval(fetchState, 1500);
+    setInterval(fetchState, 1000);
   </script>
 </body>
 </html>
