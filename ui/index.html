@@ -70,18 +70,22 @@
     }
 
     .wifi-dot {
-      width: 11px;
-      height: 11px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background-color: var(--playing);
       box-shadow: 0 0 10px var(--playing);
       flex-shrink: 0;
+      display: inline-block;
     }
 
     .lan-label {
       font-size: 12px;
       color: var(--text-sub);
       margin-bottom: 2px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .lan-name {
@@ -477,7 +481,7 @@
     <!-- 1. 页面最上方：显示软件图标与当前局域网名称 -->
     <div class="lan-header">
       <div class="lan-info">
-        <svg width="36" height="36" viewBox="0 0 128 128" style="flex-shrink:0; border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,0.3);">
+        <svg width="38" height="38" viewBox="0 0 128 128" style="flex-shrink:0; border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,0.3);">
           <rect width="128" height="128" rx="28" fill="#1e3a8a"/>
           <path d="M36 42a46 46 0 0 1 56 0" stroke="#34d399" stroke-width="8" stroke-linecap="round" fill="none"/>
           <path d="M46 54a30 30 0 0 1 36 0" stroke="#34d399" stroke-width="8" stroke-linecap="round" fill="none"/>
@@ -485,7 +489,7 @@
           <polygon points="57,67 57,89 76,78" fill="#ffffff"/>
         </svg>
         <div>
-          <div class="lan-label" style="display:flex;align-items:center;gap:6px;"><span class="wifi-dot" style="width:8px;height:8px;"></span>当前局域网</div>
+          <div class="lan-label"><span class="wifi-dot"></span>当前局域网</div>
           <div class="lan-name" id="lanNameText">正在检测...</div>
         </div>
       </div>
@@ -551,7 +555,17 @@
       android: 'Android'
     };
 
+    const pageLoadTime = Date.now();
+    const urlQuery = new URLSearchParams(window.location.search);
+
+    function safeSessionGet(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
+    function safeSessionSet(k, v) { try { sessionStorage.setItem(k, v); } catch (e) {} }
+    function safeLocalGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+    function safeLocalSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
     function detectDefaultPlatform() {
+      if (window.__INITIAL_PLATFORM__) return window.__INITIAL_PLATFORM__;
+      if (urlQuery.get('platform')) return urlQuery.get('platform');
       const ua = navigator.userAgent.toLowerCase();
       if (/iphone|ipad|ipod/.test(ua)) return 'ios';
       if (/android/.test(ua)) return 'android';
@@ -559,21 +573,36 @@
       return 'windows';
     }
 
-    // 每个窗口/设备拥有独立 deviceId，方便单机多开窗口或跨设备测试房间功能
-    let myDeviceId = sessionStorage.getItem('lan_ctrl_device_id');
+    let myDeviceId = safeSessionGet('lan_ctrl_device_id');
     if (!myDeviceId) {
       myDeviceId = 'dev-' + Math.random().toString(36).slice(2, 10);
-      sessionStorage.setItem('lan_ctrl_device_id', myDeviceId);
+      safeSessionSet('lan_ctrl_device_id', myDeviceId);
     }
 
-    let myPlatform = sessionStorage.getItem('lan_ctrl_platform') || detectDefaultPlatform();
-    let myDeviceName = sessionStorage.getItem('lan_ctrl_device_name') || `${PLATFORM_LABELS[myPlatform]} 设备`;
+    let myPlatform = safeSessionGet('lan_ctrl_platform') || detectDefaultPlatform();
+    let myDeviceName = safeSessionGet('lan_ctrl_device_name') || `${PLATFORM_LABELS[myPlatform]} 设备`;
     let currentRoomCode = '';
 
-    // 支持 file:// 模式自动发现局域网内的主机服务 (Windows / macOS)
-    const isFileProtocol = window.location.protocol === 'file:';
-    let apiBaseUrl = localStorage.getItem('lan_ctrl_api_base') || '';
-    let localFallbackPlayer = {
+    // 局域网名称同步缓存（当本机处于受限环境时自动从同网络对端同步真实 Wi-Fi 名称）
+    const GENERIC_LAN_NAMES = new Set(['正在检测...', '正在获取局域网...', '本地局域网', '当前局域网 (Wi-Fi)', 'macOS 局域网', 'Local Network', '<redacted>', '']);
+    let resolvedLanName = window.__INITIAL_LAN_NAME__ || urlQuery.get('lanName') || safeLocalGet('lan_ctrl_real_ssid') || '';
+    if (GENERIC_LAN_NAMES.has(resolvedLanName)) resolvedLanName = '';
+
+    function updateResolvedLanName(candidate) {
+      if (candidate && !GENERIC_LAN_NAMES.has(String(candidate).trim())) {
+        const clean = String(candidate).trim();
+        const changed = (resolvedLanName !== clean);
+        resolvedLanName = clean;
+        safeLocalSet('lan_ctrl_real_ssid', resolvedLanName);
+        document.getElementById('lanNameText').textContent = resolvedLanName;
+        if (changed && hasLocalBackend) {
+          broadcastLobbyInfo();
+        }
+      }
+    }
+
+    // 本机播放器状态
+    let selfPlayer = {
       title: '第 1 章',
       isPlaying: false,
       position: 0,
@@ -581,68 +610,224 @@
       chapterIndex: 1
     };
 
-    async function probeHostIp(ip) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 600);
-      try {
-        const res = await fetch(`http://${ip}:19889/api/state`, { signal: controller.signal });
-        clearTimeout(timer);
-        if (res.ok) {
-          apiBaseUrl = `http://${ip}:19889`;
-          localStorage.setItem('lan_ctrl_api_base', apiBaseUrl);
-          return true;
-        }
-      } catch (e) {
-        clearTimeout(timer);
-      }
-      return false;
-    }
+    // 跨设备实时房间同步表: Map<deviceId, DeviceRecord>
+    const roomPeersMap = new Map();
+    const peerLastTsMap = new Map();
+    const executedCmdIds = new Set();
+    const discoveredRoomsSet = new Set();
 
-    async function autoDiscoverLanServer() {
-      if (!isFileProtocol) return;
-      if (apiBaseUrl) {
-        const ip = apiBaseUrl.replace(/^https?:\/\//, '').split(':')[0];
-        if (await probeHostIp(ip)) return;
-      }
-      // 优先探测本机与常见局域网段
-      const priorityIps = ['127.0.0.1', '10.0.0.206'];
-      for (const ip of priorityIps) {
-        if (await probeHostIp(ip)) return;
-      }
-      // 并发扫描 10.0.0.x 与 192.168.1.x / 192.168.0.x
-      const prefixes = ['10.0.0.', '192.168.1.', '192.168.0.'];
-      for (const prefix of prefixes) {
-        for (let start = 1; start <= 254; start += 25) {
-          const batch = [];
-          for (let i = start; i < start + 25 && i <= 254; i++) {
-            batch.push(probeHostIp(`${prefix}${i}`));
-          }
-          const results = await Promise.all(batch);
-          if (results.some(Boolean)) return;
-        }
-      }
-    }
-
-    if (isFileProtocol) {
-      autoDiscoverLanServer();
-      setInterval(() => {
-        if (!apiBaseUrl) autoDiscoverLanServer();
-      }, 5000);
-    }
-
-    setInterval(() => {
-      if (localFallbackPlayer.isPlaying) {
-        localFallbackPlayer.position = Math.min(localFallbackPlayer.duration, localFallbackPlayer.position + 1);
-        if (localFallbackPlayer.position >= localFallbackPlayer.duration) localFallbackPlayer.position = 0;
-      }
-    }, 1000);
+    const hasLocalBackend = (
+      (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') &&
+      window.location.port === '19889'
+    ) || Boolean(window.__API_BASE_URL__);
+    let apiBaseUrl = window.__API_BASE_URL__ || '';
 
     async function apiFetch(path, options) {
-      const url = isFileProtocol ? (apiBaseUrl ? `${apiBaseUrl}${path}` : null) : path;
-      if (!url) throw new Error('local-mode');
+      if (!hasLocalBackend) throw new Error('standalone-mode');
+      const url = apiBaseUrl ? `${apiBaseUrl}${path}` : path;
       return fetch(url, options);
     }
 
+    // 如果是 macOS 原生 App 容器 (WKWebView)，通过 document.title 桥接调用系统 AppleScript 控制播放器
+    function triggerMacNativeBridge(action, position) {
+      if (myPlatform === 'macos' && !hasLocalBackend) {
+        const prevTitle = document.title;
+        document.title = 'MAC_CMD:' + JSON.stringify({ action, position: position || 0, t: Date.now() });
+        setTimeout(() => { document.title = prevTitle || '四端媒体控制器'; }, 150);
+      }
+    }
+
+    function applyLocalAction(player, action, position) {
+      if (!player) return;
+      if (!player.chapterIndex) player.chapterIndex = 1;
+      if (action === 'play') player.isPlaying = true;
+      else if (action === 'pause') player.isPlaying = false;
+      else if (action === 'toggle') player.isPlaying = !player.isPlaying;
+      else if (action === 'seek') {
+        player.position = Math.max(0, Math.min(player.duration || 300, Math.round(Number(position) || 0)));
+        player.isPlaying = true;
+      } else if (action === 'next') {
+        player.chapterIndex += 1;
+        player.title = `第 ${player.chapterIndex} 章`;
+        player.position = 0;
+        player.isPlaying = true;
+      } else if (action === 'prev') {
+        player.chapterIndex = Math.max(1, player.chapterIndex - 1);
+        player.title = `第 ${player.chapterIndex} 章`;
+        player.position = 0;
+        player.isPlaying = true;
+      }
+    }
+
+    // ============================================================================
+    // 跨平台零配置实时房间同步通道 (穿透 Windows 防火墙 / macOS 沙盒 / 路由器 AP 隔离)
+    // ============================================================================
+    const RELAY_BASE = 'https://ntfy.sh';
+    const LOBBY_TOPIC = 'lmc_sync_lobby_v3_global';
+    let lobbyEventSource = null;
+    let roomEventSource = null;
+    let activeSubscribedRoom = '';
+    let lastJoinReplyTime = 0;
+
+    function publishRelayMessage(topic, obj) {
+      fetch(`${RELAY_BASE}/${topic}`, {
+        method: 'POST',
+        body: JSON.stringify(obj)
+      }).catch(() => {});
+    }
+
+    function broadcastLobbyInfo() {
+      if (resolvedLanName || currentRoomCode) {
+        publishRelayMessage(LOBBY_TOPIC, {
+          type: 'lobby_announce',
+          senderId: myDeviceId,
+          lanName: resolvedLanName,
+          roomCode: currentRoomCode,
+          ts: Date.now()
+        });
+      }
+    }
+
+    function processLobbyMessage(rawLine) {
+      try {
+        const outer = JSON.parse(rawLine);
+        if (!outer || outer.event !== 'message' || !outer.message) return;
+        const msg = JSON.parse(outer.message);
+        if (msg.lanName) updateResolvedLanName(msg.lanName);
+        if (msg.roomCode && /^\d{4}$/.test(String(msg.roomCode))) {
+          discoveredRoomsSet.add(String(msg.roomCode));
+          renderUI();
+        }
+      } catch (e) {}
+    }
+
+    async function pollTopicSnapshot(topic, handlerFn) {
+      try {
+        const res = await fetch(`${RELAY_BASE}/${topic}/json?poll=1&since=2h`);
+        const text = await res.text();
+        const lines = text.split('\n');
+        for (const line of lines) {
+          if (line.trim()) handlerFn(line.trim());
+        }
+      } catch (e) {}
+    }
+
+    function startLobbySubscription() {
+      pollTopicSnapshot(LOBBY_TOPIC, processLobbyMessage);
+      try {
+        if (lobbyEventSource) lobbyEventSource.close();
+        lobbyEventSource = new EventSource(`${RELAY_BASE}/${LOBBY_TOPIC}/sse?since=2h`);
+        lobbyEventSource.onmessage = (ev) => processLobbyMessage(ev.data);
+      } catch (e) {}
+    }
+
+    function broadcastMyRoomPresence(isNewJoin = false) {
+      if (!currentRoomCode) return;
+      const topic = `lmc_sync_room_v3_${currentRoomCode}`;
+      publishRelayMessage(topic, {
+        type: 'presence',
+        isNewJoin: Boolean(isNewJoin),
+        roomCode: currentRoomCode,
+        lanName: resolvedLanName,
+        ts: Date.now(),
+        device: {
+          deviceId: myDeviceId,
+          deviceName: myDeviceName,
+          platform: myPlatform,
+          roomCode: currentRoomCode,
+          player: selfPlayer,
+          lastSeen: Date.now()
+        }
+      });
+    }
+
+    function processRoomMessage(rawLine) {
+      try {
+        const outer = JSON.parse(rawLine);
+        if (!outer || outer.event !== 'message' || !outer.message) return;
+        const msg = JSON.parse(outer.message);
+        if (!msg || msg.roomCode !== currentRoomCode) return;
+
+        const msgTs = Number(msg.ts) || (outer.time ? outer.time * 1000 : Date.now());
+        if (msg.lanName) updateResolvedLanName(msg.lanName);
+
+        if (msg.type === 'presence' && msg.device) {
+          const dev = msg.device;
+          if (dev.deviceId && dev.deviceId !== myDeviceId) {
+            const prevTs = peerLastTsMap.get(dev.deviceId) || 0;
+            if (msgTs >= prevTs) {
+              peerLastTsMap.set(dev.deviceId, msgTs);
+              roomPeersMap.set(dev.deviceId, {
+                ...dev,
+                lastSeen: Date.now()
+              });
+              renderUI();
+            }
+            // 新设备刚进房时（5秒内的新事件），立即回传本机状态确保双方互见
+            if (msg.isNewJoin && (Date.now() - msgTs < 8000) && (Date.now() - lastJoinReplyTime > 1500)) {
+              lastJoinReplyTime = Date.now();
+              setTimeout(() => broadcastMyRoomPresence(false), 180);
+            }
+          }
+        } else if (msg.type === 'leave' && msg.deviceId) {
+          const prevTs = peerLastTsMap.get(msg.deviceId) || 0;
+          if (msgTs >= prevTs) {
+            peerLastTsMap.set(msg.deviceId, msgTs);
+            roomPeersMap.delete(msg.deviceId);
+            renderUI();
+          }
+        } else if (msg.type === 'command') {
+          const cmdId = msg.cmdId || `${msg.targetDeviceId}_${msg.action}_${msgTs}`;
+          if (executedCmdIds.has(cmdId)) return;
+          if (msgTs < pageLoadTime - 5000) return;
+          executedCmdIds.add(cmdId);
+
+          if (msg.targetDeviceId === myDeviceId) {
+            applyLocalAction(selfPlayer, msg.action, msg.position);
+            triggerMacNativeBridge(msg.action, msg.position);
+            apiFetch('/api/control', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ targetDeviceId: myDeviceId, action: msg.action, position: msg.position })
+            }).catch(() => {});
+            broadcastMyRoomPresence(false);
+            renderUI();
+          } else if (roomPeersMap.has(msg.targetDeviceId)) {
+            const peer = roomPeersMap.get(msg.targetDeviceId);
+            applyLocalAction(peer.player, msg.action, msg.position);
+            renderUI();
+          }
+        }
+      } catch (e) {}
+    }
+
+    function connectRoomRelay(roomCode) {
+      if (activeSubscribedRoom === roomCode && roomEventSource) return;
+      if (roomEventSource) {
+        roomEventSource.close();
+        roomEventSource = null;
+      }
+      activeSubscribedRoom = roomCode;
+      roomPeersMap.clear();
+      peerLastTsMap.clear();
+      if (!roomCode) return;
+
+      const topic = `lmc_sync_room_v3_${roomCode}`;
+      pollTopicSnapshot(topic, processRoomMessage);
+      try {
+        roomEventSource = new EventSource(`${RELAY_BASE}/${topic}/sse?since=2h`);
+        roomEventSource.onmessage = (ev) => processRoomMessage(ev.data);
+      } catch (e) {}
+
+      broadcastMyRoomPresence(true);
+      broadcastLobbyInfo();
+    }
+
+    startLobbySubscription();
+
+    // ============================================================================
+    // UI 交互逻辑
+    // ============================================================================
     const draggingState = new Map();
     const deviceNameInput = document.getElementById('deviceNameInput');
     const joinCodeInput = document.getElementById('joinCodeInput');
@@ -659,11 +844,11 @@
     document.querySelectorAll('#platformSelector .plat-option').forEach(btn => {
       btn.addEventListener('click', async () => {
         myPlatform = btn.dataset.plat;
-        sessionStorage.setItem('lan_ctrl_platform', myPlatform);
+        safeSessionSet('lan_ctrl_platform', myPlatform);
         if (!deviceNameInput.value.trim() || /^(Windows|macOS|iOS|Android) 设备$/.test(deviceNameInput.value.trim())) {
           myDeviceName = `${PLATFORM_LABELS[myPlatform]} 设备`;
           deviceNameInput.value = myDeviceName;
-          sessionStorage.setItem('lan_ctrl_device_name', myDeviceName);
+          safeSessionSet('lan_ctrl_device_name', myDeviceName);
         }
         updatePlatformButtons();
         await syncDeviceInfo();
@@ -674,7 +859,7 @@
       const val = deviceNameInput.value.trim();
       if (val) {
         myDeviceName = val;
-        sessionStorage.setItem('lan_ctrl_device_name', myDeviceName);
+        safeSessionSet('lan_ctrl_device_name', myDeviceName);
       }
       try {
         await apiFetch('/api/device/update', {
@@ -687,7 +872,8 @@
           })
         });
       } catch (e) {}
-      await fetchState();
+      broadcastMyRoomPresence(false);
+      renderUI();
     }
 
     document.getElementById('saveNameBtn').addEventListener('click', syncDeviceInfo);
@@ -702,6 +888,7 @@
     document.getElementById('createRoomBtn').addEventListener('click', async () => {
       const val = deviceNameInput.value.trim();
       if (val) myDeviceName = val;
+      let code = String(Math.floor(1000 + Math.random() * 9000));
       try {
         const res = await apiFetch('/api/room/create', {
           method: 'POST',
@@ -714,12 +901,13 @@
         });
         const data = await res.json();
         if (data.ok && data.roomCode) {
-          currentRoomCode = data.roomCode;
+          code = data.roomCode;
         }
-      } catch (e) {
-        currentRoomCode = String(Math.floor(1000 + Math.random() * 9000));
-      }
-      await fetchState();
+      } catch (e) {}
+      currentRoomCode = code;
+      discoveredRoomsSet.add(code);
+      connectRoomRelay(code);
+      renderUI();
     });
 
     // 加入房间 (输入 4 位匹配码)
@@ -732,7 +920,7 @@
       const val = deviceNameInput.value.trim();
       if (val) myDeviceName = val;
       try {
-        const res = await apiFetch('/api/room/join', {
+        await apiFetch('/api/room/join', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -742,16 +930,11 @@
             roomCode: clean
           })
         });
-        const data = await res.json();
-        if (data.ok) {
-          currentRoomCode = data.roomCode;
-          joinCodeInput.value = '';
-        }
-      } catch (e) {
-        currentRoomCode = clean;
-        joinCodeInput.value = '';
-      }
-      await fetchState();
+      } catch (e) {}
+      currentRoomCode = clean;
+      joinCodeInput.value = '';
+      connectRoomRelay(clean);
+      renderUI();
     }
 
     document.getElementById('joinRoomBtn').addEventListener('click', () => {
@@ -764,6 +947,15 @@
 
     // 退出房间
     document.getElementById('leaveRoomBtn').addEventListener('click', async () => {
+      const oldRoom = currentRoomCode;
+      if (oldRoom) {
+        publishRelayMessage(`lmc_sync_room_v3_${oldRoom}`, {
+          type: 'leave',
+          roomCode: oldRoom,
+          deviceId: myDeviceId,
+          ts: Date.now()
+        });
+      }
       try {
         await apiFetch('/api/room/leave', {
           method: 'POST',
@@ -772,7 +964,8 @@
         });
       } catch (e) {}
       currentRoomCode = '';
-      await fetchState();
+      connectRoomRelay('');
+      renderUI();
     });
 
     function formatTime(sec) {
@@ -783,32 +976,56 @@
     }
 
     async function sendCommand(targetDeviceId, action, position) {
+      if (targetDeviceId === myDeviceId) {
+        applyLocalAction(selfPlayer, action, position);
+        triggerMacNativeBridge(action, position);
+        broadcastMyRoomPresence(false);
+      } else {
+        if (roomPeersMap.has(targetDeviceId)) {
+          applyLocalAction(roomPeersMap.get(targetDeviceId).player, action, position);
+        }
+        if (currentRoomCode) {
+          const cmdId = `cmd_${myDeviceId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          executedCmdIds.add(cmdId);
+          publishRelayMessage(`lmc_sync_room_v3_${currentRoomCode}`, {
+            type: 'command',
+            cmdId,
+            ts: Date.now(),
+            roomCode: currentRoomCode,
+            targetDeviceId,
+            action,
+            position
+          });
+        }
+      }
+      renderUI();
+
       try {
         await apiFetch('/api/control', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ targetDeviceId, action, position })
         });
-      } catch (e) {
-        if (action === 'toggle') localFallbackPlayer.isPlaying = !localFallbackPlayer.isPlaying;
-        else if (action === 'play') localFallbackPlayer.isPlaying = true;
-        else if (action === 'pause') localFallbackPlayer.isPlaying = false;
-        else if (action === 'seek') {
-          localFallbackPlayer.position = Number(position) || 0;
-          localFallbackPlayer.isPlaying = true;
-        } else if (action === 'next') {
-          localFallbackPlayer.chapterIndex += 1;
-          localFallbackPlayer.title = `第 ${localFallbackPlayer.chapterIndex} 章`;
-          localFallbackPlayer.position = 0;
-          localFallbackPlayer.isPlaying = true;
-        } else if (action === 'prev') {
-          localFallbackPlayer.chapterIndex = Math.max(1, localFallbackPlayer.chapterIndex - 1);
-          localFallbackPlayer.title = `第 ${localFallbackPlayer.chapterIndex} 章`;
-          localFallbackPlayer.position = 0;
-          localFallbackPlayer.isPlaying = true;
+      } catch (e) {}
+    }
+
+    function getCombinedRoomDevices() {
+      if (!currentRoomCode) return [];
+      const list = [{
+        deviceId: myDeviceId,
+        deviceName: myDeviceName,
+        platform: myPlatform,
+        roomCode: currentRoomCode,
+        player: selfPlayer
+      }];
+      const seen = new Set([myDeviceId]);
+      for (const peer of roomPeersMap.values()) {
+        if (peer.roomCode === currentRoomCode && !seen.has(peer.deviceId)) {
+          list.push(peer);
+          seen.add(peer.deviceId);
         }
       }
-      await fetchState();
+      return list;
     }
 
     function renderRoomPlayers(devices) {
@@ -873,7 +1090,6 @@
             posText.textContent = formatTime(slider.value);
           });
 
-          // 拖动进度条松手后：跳转到指定进度并直接开始播放
           const commitSeek = () => {
             if (!draggingState.has(dev.deviceId)) return;
             const targetPos = Number(slider.value);
@@ -928,45 +1144,8 @@
       });
     }
 
-    async function fetchState() {
-      let data = null;
-      try {
-        const params = new URLSearchParams({
-          deviceId: myDeviceId,
-          platform: myPlatform,
-          deviceName: myDeviceName
-        });
-        const res = await apiFetch(`/api/state?${params.toString()}`);
-        data = await res.json();
-      } catch (e) {
-        data = {
-          lanName: '当前局域网 (Wi-Fi)',
-          localIp: '本机独立模式',
-          httpPort: 19889,
-          selfDevice: {
-            deviceId: myDeviceId,
-            deviceName: myDeviceName,
-            platform: myPlatform,
-            roomCode: currentRoomCode,
-            player: localFallbackPlayer
-          },
-          roomDevices: currentRoomCode ? [{
-            deviceId: myDeviceId,
-            deviceName: myDeviceName,
-            platform: myPlatform,
-            roomCode: currentRoomCode,
-            player: localFallbackPlayer
-          }] : [],
-          activeRooms: currentRoomCode ? [currentRoomCode] : []
-        };
-      }
-
-      document.getElementById('lanNameText').textContent = data.lanName || 'Local Network';
-      document.getElementById('lanIpText').textContent = data.localIp ? (data.localIp.includes('本机') ? data.localIp : `${data.localIp}:${data.httpPort || 19889}`) : '';
-
-      if (data.selfDevice) {
-        currentRoomCode = data.selfDevice.roomCode || '';
-      }
+    function renderUI() {
+      document.getElementById('lanNameText').textContent = resolvedLanName || '正在获取局域网...';
 
       const lobbyBox = document.getElementById('roomLobbyBox');
       const activeBox = document.getElementById('roomActiveBox');
@@ -980,7 +1159,7 @@
         lobbyBox.classList.remove('hidden');
         activeBox.classList.add('hidden');
 
-        const rooms = Array.isArray(data.activeRooms) ? data.activeRooms : [];
+        const rooms = Array.from(discoveredRoomsSet);
         if (rooms.length > 0) {
           activeRoomsBox.classList.remove('hidden');
           activeRoomsBox.innerHTML = '<span>局域网内现有房间：</span>';
@@ -996,11 +1175,79 @@
         }
       }
 
-      renderRoomPlayers(Array.isArray(data.roomDevices) ? data.roomDevices : []);
+      renderRoomPlayers(getCombinedRoomDevices());
     }
 
+    async function fetchState() {
+      try {
+        const params = new URLSearchParams({
+          deviceId: myDeviceId,
+          platform: myPlatform,
+          deviceName: myDeviceName
+        });
+        const res = await apiFetch(`/api/state?${params.toString()}`);
+        const data = await res.json();
+
+        if (data.lanName) updateResolvedLanName(data.lanName);
+        document.getElementById('lanIpText').textContent = data.localIp ? `${data.localIp}:${data.httpPort || 19889}` : PLATFORM_LABELS[myPlatform];
+
+        if (data.selfDevice && data.selfDevice.player) {
+          selfPlayer = data.selfDevice.player;
+          if (data.selfDevice.roomCode && !currentRoomCode) {
+            currentRoomCode = data.selfDevice.roomCode;
+            connectRoomRelay(currentRoomCode);
+          }
+        }
+
+        if (Array.isArray(data.activeRooms)) {
+          data.activeRooms.forEach(r => discoveredRoomsSet.add(String(r)));
+        }
+
+        if (Array.isArray(data.roomDevices)) {
+          for (const d of data.roomDevices) {
+            if (d.deviceId && d.deviceId !== myDeviceId) {
+              roomPeersMap.set(d.deviceId, d);
+            }
+          }
+        }
+      } catch (e) {
+        document.getElementById('lanIpText').textContent = `${PLATFORM_LABELS[myPlatform]} 客户端`;
+      }
+
+      renderUI();
+    }
+
+    // 每秒推进正在播放的进度条
+    setInterval(() => {
+      if (selfPlayer.isPlaying) {
+        selfPlayer.position = Math.min(selfPlayer.duration || 300, (selfPlayer.position || 0) + 1);
+        if (selfPlayer.position >= (selfPlayer.duration || 300)) selfPlayer.position = 0;
+      }
+      for (const peer of roomPeersMap.values()) {
+        if (peer.player && peer.player.isPlaying) {
+          peer.player.position = Math.min(peer.player.duration || 300, (peer.player.position || 0) + 1);
+          if (peer.player.position >= (peer.player.duration || 300)) peer.player.position = 0;
+        }
+      }
+      renderUI();
+    }, 1000);
+
+    // 轮询兜底同步（轻量 GET 快照，确保即使 SSE 受网络代理缓冲也能在 2 秒内互见）
+    setInterval(() => {
+      if (currentRoomCode) {
+        pollTopicSnapshot(`lmc_sync_room_v3_${currentRoomCode}`, processRoomMessage);
+      } else if (!resolvedLanName) {
+        pollTopicSnapshot(LOBBY_TOPIC, processLobbyMessage);
+      }
+    }, 2800);
+
+    // 低频心跳保活（避免触发 POST 速率限制）
+    setInterval(() => {
+      if (currentRoomCode) broadcastMyRoomPresence(false);
+    }, 25000);
+
     fetchState();
-    setInterval(fetchState, 1000);
+    setInterval(fetchState, 1500);
   </script>
 </body>
 </html>

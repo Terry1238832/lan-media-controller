@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 构建 100% 符合 Apple TN1150 规范的 GPT + HFS+ (H+) macOS .dmg 磁盘映像
-可在 macOS Finder 中直接双击挂载 (DiskImageMounter / hdiutil attach)，内含带自定义图标的 LanMediaController.app
+内含：
+1. 原生 Cocoa (NSWindow + WKWebView) 桌面应用 LanMediaController.app（带自定义图标，非网页标签页）
+2. 原生 HFS+ Applications 符号链接（支持将 LanMediaController.app 直接拖拽到 Applications 安装）
 """
 
 import os
@@ -38,17 +40,171 @@ def build_macos_app_files():
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "LanMediaController",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.2",
-        "CFBundleVersion": "3",
+        "CFBundleShortVersionString": "0.1.3",
+        "CFBundleVersion": "4",
         "LSMinimumSystemVersion": "10.15",
         "NSHighResolutionCapable": True,
+        "NSAppTransportSecurity": {
+            "NSAllowsArbitraryLoads": True
+        },
         "NSLocalNetworkUsageDescription": "用于在局域网内发现并同步控制四端播放器",
         "NSAppleEventsUsageDescription": "用于控制 macOS 音乐播放器播放、暂停、上下章与进度跳转"
     })
 
+    mac_app_jxa = ("""ObjC.import('Cocoa');
+ObjC.import('WebKit');
+ObjC.import('stdlib');
+
+var G = {
+  win: null,
+  webView: null,
+  lastCmd: ''
+};
+
+function triggerAppleScriptMedia(action, pos) {
+  var p = Math.max(0, Math.round(Number(pos) || 0));
+  var script = '';
+  if (action === 'play') {
+    script = 'if application "Music" is running then tell application "Music" to play\\nif application "Spotify" is running then tell application "Spotify" to play';
+  } else if (action === 'pause') {
+    script = 'if application "Music" is running then tell application "Music" to pause\\nif application "Spotify" is running then tell application "Spotify" to pause';
+  } else if (action === 'toggle') {
+    script = 'if application "Music" is running then tell application "Music" to playpause\\nif application "Spotify" is running then tell application "Spotify" to playpause';
+  } else if (action === 'next') {
+    script = 'if application "Music" is running then tell application "Music" to next track\\nif application "Spotify" is running then tell application "Spotify" to next track';
+  } else if (action === 'prev') {
+    script = 'if application "Music" is running then tell application "Music" to previous track\\nif application "Spotify" is running then tell application "Spotify" to previous track';
+  } else if (action === 'seek') {
+    script = 'if application "Music" is running then tell application "Music" to set player position to ' + p + '\\nif application "Spotify" is running then tell application "Spotify" to set player position to ' + p + '\\nif application "Music" is running then tell application "Music" to play\\nif application "Spotify" is running then tell application "Spotify" to play';
+  }
+  if (!script) return;
+  try {
+    var task = $.NSTask.alloc.init;
+    task.setLaunchPath($('/usr/bin/osascript'));
+    task.setArguments($(['-e', script]));
+    task.launch;
+  } catch (e) {}
+}
+
+ObjC.registerSubclass({
+  name: 'LMCMainThreadRunner',
+  superclass: 'NSObject',
+  methods: {
+    'startApp:': {
+      types: ['void', ['id']],
+      implementation: function(arg) {
+        var env = $.NSProcessInfo.processInfo.environment;
+        var resDirObj = env.objectForKey('LMC_RES_DIR');
+        var ssidObj = env.objectForKey('LMC_WIFI_SSID');
+        var resDir = (resDirObj && !resDirObj.isNil()) ? ObjC.unwrap(resDirObj) : '';
+        var ssid = (ssidObj && !ssidObj.isNil()) ? ObjC.unwrap(ssidObj) : '';
+
+        var app = $.NSApplication.sharedApplication;
+        app.setActivationPolicy($.NSApplicationActivationPolicyRegular);
+
+        var menubar = $.NSMenu.alloc.init;
+        var appMenuItem = $.NSMenuItem.alloc.init;
+        menubar.addItem(appMenuItem);
+        var appMenu = $.NSMenu.alloc.init;
+        appMenu.addItemWithTitleActionKeyEquivalent($('退出 四端媒体控制器'), 'terminate:', $('q'));
+        appMenuItem.setSubmenu(appMenu);
+
+        var editMenuItem = $.NSMenuItem.alloc.init;
+        menubar.addItem(editMenuItem);
+        var editMenu = $.NSMenu.alloc.initWithTitle($('编辑'));
+        editMenu.addItemWithTitleActionKeyEquivalent($('剪切'), 'cut:', $('x'));
+        editMenu.addItemWithTitleActionKeyEquivalent($('拷贝'), 'copy:', $('c'));
+        editMenu.addItemWithTitleActionKeyEquivalent($('粘贴'), 'paste:', $('v'));
+        editMenu.addItemWithTitleActionKeyEquivalent($('全选'), 'selectAll:', $('a'));
+        editMenuItem.setSubmenu(editMenu);
+        app.setMainMenu(menubar);
+
+        var icnsPath = resDir + '/AppIcon.icns';
+        var iconImg = $.NSImage.alloc.initWithContentsOfFile($(icnsPath));
+        if (iconImg && !iconImg.isNil()) {
+          app.setApplicationIconImage(iconImg);
+        }
+
+        var rect = $.NSMakeRect(0, 0, 560, 760);
+        var styleMask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+        var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(rect, styleMask, 2, false);
+        win.setTitle($('四端局域网媒体控制器'));
+        win.center;
+        win.setDelegate(this);
+        win.setReleasedWhenClosed(false);
+        G.win = win;
+
+        var cfg = $.WKWebViewConfiguration.alloc.init;
+        var wv = $.WKWebView.alloc.initWithFrameConfiguration($.NSMakeRect(0, 0, 560, 760), cfg);
+        wv.setAutoresizingMask(18);
+        win.setContentView(wv);
+        G.webView = wv;
+
+        var htmlPath = resDir + '/ui/index.html';
+        var nsHtml = $.NSString.stringWithContentsOfFileEncodingError($(htmlPath), $.NSUTF8StringEncoding, null);
+        if (nsHtml && !nsHtml.isNil()) {
+          var htmlStr = ObjC.unwrap(nsHtml);
+          var inject = '<script>window.__INITIAL_PLATFORM__="macos";window.__INITIAL_LAN_NAME__=' + JSON.stringify(ssid || '') + ';</script></head>';
+          htmlStr = htmlStr.replace('</head>', inject);
+          wv.loadHTMLStringBaseURL($(htmlStr), $.NSURL.URLWithString($('https://ntfy.sh/')));
+        }
+
+        $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(0.25, this, 'pollTitle:', null, true);
+
+        win.makeKeyAndOrderFront(null);
+        app.activateIgnoringOtherApps(true);
+        app.run;
+      }
+    },
+    'pollTitle:': {
+      types: ['void', ['id']],
+      implementation: function(timer) {
+        if (!G.webView) return;
+        var tObj = G.webView.title;
+        if (tObj && !tObj.isNil()) {
+          var t = ObjC.unwrap(tObj);
+          if (t && t.indexOf('MAC_CMD:') === 0 && t !== G.lastCmd) {
+            G.lastCmd = t;
+            try {
+              var cmd = JSON.parse(t.slice(8));
+              triggerAppleScriptMedia(cmd.action, cmd.position);
+            } catch (e) {}
+          }
+        }
+      }
+    },
+    'windowWillClose:': {
+      types: ['void', ['id']],
+      implementation: function(notification) {
+        $.exit(0);
+      }
+    }
+  }
+});
+
+var runner = $.LMCMainThreadRunner.alloc.init;
+runner.performSelectorOnMainThreadWithObjectWaitUntilDone('startApp:', null, true);
+""").encode("utf-8")
+
     launcher_sh = ("""#!/bin/bash
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+SSID=""
+for DEV in en0 en1; do
+  if [ -z "$SSID" ]; then
+    SSID=$(ipconfig getsummary "$DEV" 2>/dev/null | awk -F ' : ' '/^  SSID : / {print $2}' | tr -d '\\r\\n')
+  fi
+  if [ -z "$SSID" ]; then
+    SSID=$(networksetup -getairportnetwork "$DEV" 2>/dev/null | sed -n 's/^Current Wi-Fi Network: //p' | tr -d '\\r\\n')
+  fi
+done
+if [ "$SSID" = "<redacted>" ] || [ "$SSID" = "You are not associated with an AirPort network." ]; then
+  SSID=""
+fi
+
+export LMC_RES_DIR="$DIR"
+export LMC_WIFI_SSID="$SSID"
 
 OLD_PID=$(lsof -ti tcp:19889 2>/dev/null)
 if [ -n "$OLD_PID" ]; then
@@ -56,27 +212,29 @@ if [ -n "$OLD_PID" ]; then
 fi
 
 if command -v node >/dev/null 2>&1; then
-  nohup node "$DIR/desktop/server.js" --open >/dev/null 2>&1 &
-elif command -v python3 >/dev/null 2>&1; then
-  nohup python3 "$DIR/desktop/server.py" --open >/dev/null 2>&1 &
-else
-  open "$DIR/ui/index.html"
+  nohup node "$DIR/desktop/server.js" >/dev/null 2>&1 &
+elif xcode-select -p >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  nohup python3 "$DIR/desktop/server.py" >/dev/null 2>&1 &
 fi
+
+exec /usr/bin/osascript -l JavaScript "$DIR/desktop/mac_app.jxa"
 """).encode("utf-8")
 
     readme_txt = (
-        "四端局域网媒体控制器 (macOS 版)\n"
-        "==============================\n\n"
-        "使用方法：\n"
-        "1. 将 LanMediaController.app 拖入 Applications (应用程序) 文件夹。\n"
-        "2. 双击打开 LanMediaController.app（若 macOS 提示未签名应用，请右键点击 LanMediaController.app -> 选择「打开」）。\n"
-        "3. 输入设备名，点击「独立开房间」生成 4 位数匹配码，或输入其他设备的 4 位数匹配码加入房间。\n"
+        "四端局域网媒体控制器 (macOS 原生桌面版)\n"
+        "========================================\n\n"
+        "安装与使用方法：\n"
+        "1. 将磁盘映像内的 LanMediaController.app 直接拖拽到旁边的 Applications (应用程序) 文件夹中完成安装。\n"
+        "2. 在「应用程序 (Applications)」中双击打开 LanMediaController.app（若首次打开提示未签名应用，请右键点击图标 -> 选择「打开」）。\n"
+        "3. 软件将以原生 macOS 桌面应用窗口运行，输入设备名称并点击「独立开房间」或输入 4 位数匹配码「加入房间」即可与 Windows / iOS / Android 实时互控。\n"
     ).encode("utf-8")
 
     return {
+        "Applications": (b"/Applications", 0o120755),
         "LanMediaController.app/Contents/Info.plist": (info_plist, 0o100644),
         "LanMediaController.app/Contents/MacOS/LanMediaController": (launcher_sh, 0o100755),
         "LanMediaController.app/Contents/Resources/AppIcon.icns": (app_icns, 0o100644),
+        "LanMediaController.app/Contents/Resources/desktop/mac_app.jxa": (mac_app_jxa, 0o100644),
         "LanMediaController.app/Contents/Resources/desktop/server.js": (server_js, 0o100644),
         "LanMediaController.app/Contents/Resources/desktop/server.py": (server_py, 0o100755),
         "LanMediaController.app/Contents/Resources/ui/index.html": (index_html, 0o100644),
@@ -136,7 +294,11 @@ def make_folder_record(folder_id, valence, mode=0o040755, is_bundle=False):
 
 def make_file_record(file_id, mode, logical_size, start_block, block_count):
     bsd = struct.pack(">IIBBHI", 0, 0, 0, 0, mode, 0)
-    user_info = b"\x00" * 16
+    # Symlink in HFS+ (TN1150) requires fdType='slnk' and fdCreator='rhap'
+    if (mode & 0o170000) == 0o120000:
+        user_info = struct.pack(">4s4sHhhh", b"slnk", b"rhap", 0, 0, 0, 0)
+    else:
+        user_info = b"\x00" * 16
     finder_info = b"\x00" * 16
     data_fork = make_fork_data(logical_size, max(4096, block_count * 4096), start_block, block_count)
     rsrc_fork = make_fork_data(0, 0, 0, 0)
@@ -398,7 +560,6 @@ def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
 
     # 1. LBA 0: Protective MBR
     mbr = bytearray(512)
-    # Partition entry 1 at offset 446: type 0xEE (GPT Protective), start LBA 1
     struct.pack_into("<BBBBBBBBII", mbr, 446, 0x00, 0x00, 0x02, 0x00, 0xEE, 0xFF, 0xFF, 0xFF, 1, total_sectors - 1)
     mbr[510] = 0x55
     mbr[511] = 0xAA
@@ -412,7 +573,6 @@ def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
     struct.pack_into("<16s16sQQQ72s", entries, 0, apple_hfs_guid, part_guid, part_start_lba, part_end_lba, 0, part_name)
     entries_crc = zlib.crc32(entries) & 0xFFFFFFFF
 
-    # 写入主 GPT 分区表 (LBA 2..33) 与备份 GPT 分区表 (LBA total_sectors-33 .. total_sectors-2)
     disk[2 * 512 : 34 * 512] = entries
     backup_entries_lba = total_sectors - 33
     disk[backup_entries_lba * 512 : (backup_entries_lba + 32) * 512] = entries
@@ -448,7 +608,6 @@ def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
         sec[0:92] = hdr
         return bytes(sec)
 
-    # 主 GPT 头 (LBA 1) 与备份 GPT 头 (LBA total_sectors - 1)
     disk[1 * 512 : 2 * 512] = make_gpt_header(1, total_sectors - 1, 2)
     disk[(total_sectors - 1) * 512 : total_sectors * 512] = make_gpt_header(total_sectors - 1, 1, backup_entries_lba)
 
