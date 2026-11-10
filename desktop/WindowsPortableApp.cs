@@ -95,7 +95,14 @@ namespace LanMediaController
             StartBackgroundTimers();
 
             TrayIcon = new NotifyIcon();
-            TrayIcon.Icon = SystemIcons.Application;
+            try
+            {
+                TrayIcon.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+            }
+            catch
+            {
+                TrayIcon.Icon = SystemIcons.Application;
+            }
             TrayIcon.Text = "\u56db\u7aef\u5c40\u57df\u7f51\u5a92\u4f53\u63a7\u5236\u5668";
             TrayIcon.Visible = true;
 

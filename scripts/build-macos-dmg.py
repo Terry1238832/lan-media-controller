@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-构建 macOS .app 应用包并打包为标准 Apple UDIF (.dmg) 磁盘映像
-包含完整的 LanMediaController.app (Info.plist + MacOS 可执行启动器 + 后台服务与前端资源)
+构建 100% 符合 Apple TN1150 规范的 GPT + HFS+ (H+) macOS .dmg 磁盘映像
+可在 macOS Finder 中直接双击挂载 (DiskImageMounter / hdiutil attach)，内含带自定义图标的 LanMediaController.app
 """
 
 import os
@@ -10,11 +10,13 @@ import struct
 import uuid
 import zlib
 import plistlib
-import datetime
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST_DIR = os.path.join(BASE_DIR, "dist")
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 os.makedirs(DIST_DIR, exist_ok=True)
+
+HFS_TIME = 3845000000  # Seconds since 1904-01-01
 
 
 def build_macos_app_files():
@@ -22,18 +24,21 @@ def build_macos_app_files():
         server_js = f.read()
     with open(os.path.join(BASE_DIR, "ui", "index.html"), "rb") as f:
         index_html = f.read()
+    with open(os.path.join(ASSETS_DIR, "AppIcon.icns"), "rb") as f:
+        app_icns = f.read()
 
     info_plist = plistlib.dumps({
         "CFBundleDevelopmentRegion": "zh_CN",
         "CFBundleDisplayName": "四端媒体控制器",
         "CFBundleExecutable": "LanMediaController",
+        "CFBundleIconFile": "AppIcon",
         "CFBundleIdentifier": "com.local.lanmediacontroller",
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "LanMediaController",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "1",
-        "LSMinimumSystemVersion": "11.0",
+        "CFBundleShortVersionString": "0.1.1",
+        "CFBundleVersion": "2",
+        "LSMinimumSystemVersion": "10.15",
         "NSHighResolutionCapable": True,
         "NSLocalNetworkUsageDescription": "用于在局域网内发现并同步控制四端播放器",
         "NSAppleEventsUsageDescription": "用于控制 macOS 音乐播放器播放、暂停、上下章与进度跳转"
@@ -43,7 +48,6 @@ def build_macos_app_files():
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-# Stop old instance on port 19889
 OLD_PID=$(lsof -ti tcp:19889 2>/dev/null)
 if [ -n "$OLD_PID" ]; then
   kill -9 $OLD_PID 2>/dev/null
@@ -52,7 +56,7 @@ fi
 if command -v node >/dev/null 2>&1; then
   nohup node "$DIR/desktop/server.js" --open >/dev/null 2>&1 &
 else
-  osascript -e 'display dialog "请先安装 Node.js (https://nodejs.org) 以运行四端局域网媒体控制器后台服务。" buttons {"好"} default button 1 with title "四端媒体控制器"'
+  open "$DIR/ui/index.html"
 fi
 """).encode("utf-8")
 
@@ -61,286 +65,398 @@ fi
         "==============================\n\n"
         "使用方法：\n"
         "1. 将 LanMediaController.app 拖入 Applications (应用程序) 文件夹。\n"
-        "2. 双击打开 LanMediaController.app，系统将自动在后台启动局域网控制服务并弹出控制页面。\n"
+        "2. 双击打开 LanMediaController.app（若 macOS 提示未签名应用，请右键点击 LanMediaController.app -> 选择「打开」）。\n"
         "3. 输入设备名，点击「独立开房间」生成 4 位数匹配码，或输入其他设备的 4 位数匹配码加入房间。\n"
     ).encode("utf-8")
 
     return {
         "LanMediaController.app/Contents/Info.plist": (info_plist, 0o100644),
         "LanMediaController.app/Contents/MacOS/LanMediaController": (launcher_sh, 0o100755),
+        "LanMediaController.app/Contents/Resources/AppIcon.icns": (app_icns, 0o100644),
         "LanMediaController.app/Contents/Resources/desktop/server.js": (server_js, 0o100644),
         "LanMediaController.app/Contents/Resources/ui/index.html": (index_html, 0o100644),
         "README.txt": (readme_txt, 0o100644),
     }
 
 
-def make_both_endian16(val):
-    return struct.pack("<H", val) + struct.pack(">H", val)
+def make_fork_data(logical_size, clump_size, start_block, block_count):
+    extents = bytearray(64)
+    if block_count > 0:
+        struct.pack_into(">II", extents, 0, start_block, block_count)
+    res = struct.pack(">QII", logical_size, clump_size, block_count) + bytes(extents)
+    assert len(res) == 80
+    return res
 
 
-def make_both_endian32(val):
-    return struct.pack("<I", val) + struct.pack(">I", val)
+def make_catalog_key(parent_id, name_str):
+    utf16 = name_str.encode("utf-16-be")
+    char_len = len(name_str)
+    key_len = 6 + len(utf16)
+    return struct.pack(">HIH", key_len, parent_id, char_len) + utf16
 
 
-def pad_sector(data, sector_size=2048):
-    rem = len(data) % sector_size
-    if rem == 0:
-        return data
-    return data + b"\x00" * (sector_size - rem)
+def make_unistr255(name_str):
+    utf16 = name_str.encode("utf-16-be")
+    return struct.pack(">H", len(name_str)) + utf16
 
 
-def make_rockridge_px_nm(name, mode, is_dir):
-    # Rock Ridge PX (POSIX file mode) + NM (Alternate Name)
-    nlinks = 2 if is_dir else 1
-    px = (
-        b"PX"
-        + struct.pack("BB", 44, 1)
-        + make_both_endian32(mode)
-        + make_both_endian32(nlinks)
-        + make_both_endian32(0)
-        + make_both_endian32(0)
-        + make_both_endian32(1)
+def make_folder_record(folder_id, valence, mode=0o040755, is_bundle=False):
+    flags = 0
+    bsd = struct.pack(">IIBBHI", 0, 0, 0, 0, mode, 0)
+    # Set kHasBundle (0x2000) in FolderInfo.finderFlags for .app bundle
+    finder_flags = 0x2000 if is_bundle else 0
+    user_info = struct.pack(">hhhhH6s", 0, 0, 0, 0, finder_flags, b"\x00" * 6)
+    finder_info = b"\x00" * 16
+    res = (
+        struct.pack(
+            ">hHIIIIIII",
+            1,          # kHFSPlusFolderRecord
+            flags,
+            valence,
+            folder_id,
+            HFS_TIME,
+            HFS_TIME,
+            HFS_TIME,
+            HFS_TIME,
+            HFS_TIME,
+        )
+        + bsd
+        + user_info
+        + finder_info
+        + struct.pack(">II", 0, 0)
     )
-    if name in (".", ".."):
-        return px
-    name_bytes = name.encode("utf-8")
-    nm = b"NM" + struct.pack("BBB", 5 + len(name_bytes), 1, 0) + name_bytes
-    return px + nm
+    assert len(res) == 88
+    return res
 
 
-def make_dir_record(iso_name_bytes, extent_lba, data_len, is_dir, rr_extra=b""):
-    now = datetime.datetime.utcnow()
-    date_bytes = struct.pack(
-        "BBBBBBb",
-        now.year - 1900,
-        now.month,
-        now.day,
-        now.hour,
-        now.minute,
-        now.second,
+def make_file_record(file_id, mode, logical_size, start_block, block_count):
+    bsd = struct.pack(">IIBBHI", 0, 0, 0, 0, mode, 0)
+    user_info = b"\x00" * 16
+    finder_info = b"\x00" * 16
+    data_fork = make_fork_data(logical_size, max(4096, block_count * 4096), start_block, block_count)
+    rsrc_fork = make_fork_data(0, 0, 0, 0)
+    res = (
+        struct.pack(
+            ">hHIIIIIII",
+            2,          # kHFSPlusFileRecord
+            2,          # kHFSThreadExistsMask
+            0,
+            file_id,
+            HFS_TIME,
+            HFS_TIME,
+            HFS_TIME,
+            HFS_TIME,
+            HFS_TIME,
+        )
+        + bsd
+        + user_info
+        + finder_info
+        + struct.pack(">II", 0, 0)
+        + data_fork
+        + rsrc_fork
+    )
+    assert len(res) == 248
+    return res
+
+
+def make_thread_record(is_folder, parent_id, name_str):
+    rec_type = 3 if is_folder else 4
+    rec = struct.pack(">hhI", rec_type, 0, parent_id) + make_unistr255(name_str)
+    if len(rec) % 2 == 1:
+        rec += b"\x00"
+    return rec
+
+
+def pack_btree_node(kind, height, records, node_size):
+    node = bytearray(node_size)
+    num_recs = len(records)
+    struct.pack_into(">IIbBHH", node, 0, 0, 0, kind, height, num_recs, 0)
+
+    offsets = [14]
+    cur = 14
+    for r in records:
+        node[cur : cur + len(r)] = r
+        cur += len(r)
+        if cur % 2 == 1:
+            cur += 1
+        offsets.append(cur)
+
+    for i, off in enumerate(offsets):
+        pos = node_size - 2 * (i + 1)
+        struct.pack_into(">H", node, pos, off)
+
+    return bytes(node)
+
+
+def make_btree_header_node(tree_depth, root_node, leaf_records, first_leaf, last_leaf, node_size, max_key_len, total_nodes, free_nodes, key_compare_type, attributes, alloc_bitmap_byte0):
+    header_rec = struct.pack(
+        ">HIIIIHHIIHIBBI64s",
+        tree_depth,
+        root_node,
+        leaf_records,
+        first_leaf,
+        last_leaf,
+        node_size,
+        max_key_len,
+        total_nodes,
+        free_nodes,
         0,
+        node_size * total_nodes,
+        0,
+        key_compare_type,
+        attributes,
+        b"\x00" * 64,
     )
-    flags = 0x02 if is_dir else 0x00
-    name_len = len(iso_name_bytes)
-    pad_len = 1 if (name_len % 2 == 0) else 0
-    rec_len = 33 + name_len + pad_len + len(rr_extra)
-    if rec_len % 2 == 1:
-        rr_extra += b"\x00"
-        rec_len += 1
-
-    header = (
-        struct.pack("BB", rec_len, 0)
-        + make_both_endian32(extent_lba)
-        + make_both_endian32(data_len)
-        + date_bytes
-        + struct.pack("BBB", flags, 0, 0)
-        + make_both_endian16(1)
-        + struct.pack("B", name_len)
-        + iso_name_bytes
-        + (b"\x00" * pad_len)
-        + rr_extra
-    )
-    return header
+    assert len(header_rec) == 106
+    user_data_rec = b"\x00" * 128
+    map_rec = bytearray(node_size - 256)
+    map_rec[0] = alloc_bitmap_byte0
+    return pack_btree_node(1, 0, [header_rec, user_data_rec, bytes(map_rec)], node_size)
 
 
-def build_iso_with_rockridge(files_map):
-    """
-    构建支持 RockRidge (保留大小写文件名与 0755 可执行权限) 的 ISO9660 卷镜像
-    """
-    dirs = {"": {"subdirs": set(), "files": []}}
-    for rel_path, (content, mode) in files_map.items():
-        parts = rel_path.split("/")
-        cur = ""
-        for p in parts[:-1]:
-            nxt = f"{cur}/{p}" if cur else p
-            dirs[cur]["subdirs"].add(p)
-            if nxt not in dirs:
-                dirs[nxt] = {"subdirs": set(), "files": []}
-            cur = nxt
-        dirs[cur]["files"].append((parts[-1], content, mode))
+def build_hfsplus_volume(files_map, volume_name="LanMediaController"):
+    block_size = 4096
 
-    dir_order = sorted(dirs.keys(), key=lambda x: (x.count("/"), x))
-    base_dir_lba = 20
-    dir_lbas = {d: base_dir_lba + i for i, d in enumerate(dir_order)}
-    next_file_lba = base_dir_lba + len(dir_order)
-
-    file_alloc = {}
-    for d in dir_order:
-        for fname, content, mode in dirs[d]["files"]:
-            sectors = max(1, (len(content) + 2047) // 2048)
-            file_alloc[(d, fname)] = (next_file_lba, len(content), content, mode)
-            next_file_lba += sectors
-
-    total_iso_blocks = next_file_lba
-    dir_sectors = {}
-
-    for d in dir_order:
-        my_lba = dir_lbas[d]
-        parent_path = "/".join(d.split("/")[:-1]) if "/" in d else ""
-        parent_lba = dir_lbas[parent_path]
-
-        sp_entry = b"SP\x07\x01\xbe\xef\x00" if d == "" else b""
-        dot_rr = sp_entry + make_rockridge_px_nm(".", 0o040755, True)
-        dotdot_rr = make_rockridge_px_nm("..", 0o040755, True)
-
-        records = [
-            make_dir_record(b"\x00", my_lba, 2048, True, dot_rr),
-            make_dir_record(b"\x01", parent_lba, 2048, True, dotdot_rr),
-        ]
-
-        for idx, sub in enumerate(sorted(dirs[d]["subdirs"])):
-            sub_path = f"{d}/{sub}" if d else sub
-            sub_lba = dir_lbas[sub_path]
-            iso_name = f"DIR_{idx:02d}".encode("ascii")
-            rr = make_rockridge_px_nm(sub, 0o040755, True)
-            records.append(make_dir_record(iso_name, sub_lba, 2048, True, rr))
-
-        for idx, (fname, content, mode) in enumerate(dirs[d]["files"]):
-            flba, flen, _, fmode = file_alloc[(d, fname)]
-            iso_name = f"FILE_{idx:02d}.DAT;1".encode("ascii")
-            rr = make_rockridge_px_nm(fname, fmode, False)
-            records.append(make_dir_record(iso_name, flba, flen, False, rr))
-
-        sector_buf = b""
-        for rec in records:
-            if (len(sector_buf) % 2048) + len(rec) > 2048:
-                sector_buf = pad_sector(sector_buf, 2048)
-            sector_buf += rec
-        dir_sectors[d] = pad_sector(sector_buf, 2048)
-
-    # 构建完整 ISO 镜像
-    image = bytearray(total_iso_blocks * 2048)
-
-    # LBA 16: Primary Volume Descriptor
-    pvd = bytearray(2048)
-    pvd[0] = 1
-    pvd[1:6] = b"CD001"
-    pvd[6] = 1
-    pvd[8:40] = b"MACOS                           "
-    pvd[40:72] = b"LanMediaController              "
-    pvd[80:88] = make_both_endian32(total_iso_blocks)
-    pvd[120:124] = make_both_endian16(1)
-    pvd[124:128] = make_both_endian16(1)
-    pvd[128:132] = make_both_endian16(2048)
-    root_rec = make_dir_record(b"\x00", dir_lbas[""], 2048, True)
-    pvd[156 : 156 + len(root_rec)] = root_rec
-    pvd[881] = 1
-    image[16 * 2048 : 17 * 2048] = pvd
-
-    # LBA 17: Volume Descriptor Set Terminator
-    vdst = bytearray(2048)
-    vdst[0] = 255
-    vdst[1:6] = b"CD001"
-    vdst[6] = 1
-    image[17 * 2048 : 18 * 2048] = vdst
-
-    # 写入目录区
-    for d, lba in dir_lbas.items():
-        data = dir_sectors[d]
-        image[lba * 2048 : lba * 2048 + len(data)] = data
-
-    # 写入文件数据区
-    for (d, fname), (flba, flen, content, _) in file_alloc.items():
-        padded = pad_sector(content, 2048)
-        image[flba * 2048 : flba * 2048 + len(padded)] = padded
-
-    return bytes(image)
-
-
-def wrap_in_udif_dmg(raw_image_bytes, out_dmg_path):
-    """
-    将原始扇区镜像封装为标准 Apple UDIF (.dmg, ZLIB 压缩 + blkx Mish 表 + 512 字节 koly 尾部)
-    """
-    total_sectors = len(raw_image_bytes) // 512
-    chunk_sectors = 128  # 64KB per chunk
-    chunk_bytes = chunk_sectors * 512
-
-    compressed_chunks = []
-    runs = []
-    comp_offset = 0
-
-    for sector_idx in range(0, total_sectors, chunk_sectors):
-        count = min(chunk_sectors, total_sectors - sector_idx)
-        raw_slice = raw_image_bytes[sector_idx * 512 : (sector_idx + count) * 512]
-        zdata = zlib.compress(raw_slice, 9)
-        compressed_chunks.append(zdata)
-        runs.append((0x80000005, 0, sector_idx, count, comp_offset, len(zdata)))
-        comp_offset += len(zdata)
-
-    # 结束标记 run
-    runs.append((0xFFFFFFFF, 0, total_sectors, 0, comp_offset, 0))
-
-    data_fork = b"".join(compressed_chunks)
-    data_crc = zlib.crc32(data_fork) & 0xFFFFFFFF
-
-    # 构造 Mish 块描述头 (204 bytes + N * 40 bytes)
-    mish_header = bytearray(204)
-    struct.pack_into(">4sIQQQIII", mish_header, 0, b"mish", 1, 0, total_sectors, 0, 128, 0xFFFFFFFF, 0)
-    # Checksum struct at offset 64
-    struct.pack_into(">III", mish_header, 64, 2, 32, data_crc)
-    struct.pack_into(">I", mish_header, 192, len(runs))
-
-    run_bytes = bytearray()
-    for rtype, rres, sstart, scount, coff, clen in runs:
-        run_bytes += struct.pack(">IIQQQQ", rtype, rres, sstart, scount, coff, clen)
-
-    mish_blob = bytes(mish_header) + bytes(run_bytes)
-    master_crc = zlib.crc32(struct.pack(">I", data_crc)) & 0xFFFFFFFF
-
-    plist_dict = {
-        "resource-fork": {
-            "blkx": [
-                {
-                    "Attributes": "0x0050",
-                    "CFName": "LanMediaController (ISO9660 : 0)",
-                    "Data": mish_blob,
-                    "ID": "-1",
-                    "Name": "LanMediaController (ISO9660 : 0)",
-                }
-            ]
-        }
+    folders = {
+        "": {"id": 2, "parent": 1, "name": volume_name, "children": []}
     }
-    xml_bytes = plistlib.dumps(plist_dict, fmt=plistlib.FMT_XML)
-    xml_offset = len(data_fork)
-    xml_length = len(xml_bytes)
+    next_cnid = 16
 
-    # 构造 512 字节 koly 尾部
-    koly = bytearray(512)
-    struct.pack_into(
-        ">4sIIIQQQQQII",
-        koly,
-        0,
-        b"koly",
-        4,          # version
-        512,        # header size
-        1,          # flags (flattened read-only)
-        0,          # runningDataForkOffset
-        0,          # dataForkOffset
-        xml_offset, # dataForkLength
-        0,          # rsrcForkOffset
-        0,          # rsrcForkLength
-        1,          # segmentNumber
-        1,          # segmentCount
+    all_dir_paths = set()
+    for rel_path in files_map.keys():
+        parts = rel_path.split("/")
+        for i in range(1, len(parts)):
+            all_dir_paths.add("/".join(parts[:i]))
+
+    for dpath in sorted(all_dir_paths, key=lambda x: (x.count("/"), x)):
+        parent_path = "/".join(dpath.split("/")[:-1]) if "/" in dpath else ""
+        dname = dpath.split("/")[-1]
+        cid = next_cnid
+        next_cnid += 1
+        folders[dpath] = {
+            "id": cid,
+            "parent": folders[parent_path]["id"],
+            "name": dname,
+            "children": [],
+        }
+        folders[parent_path]["children"].append(dname)
+
+    next_data_block = 7
+    file_entries = []
+
+    for rel_path in sorted(files_map.keys()):
+        content, mode = files_map[rel_path]
+        parent_path = "/".join(rel_path.split("/")[:-1]) if "/" in rel_path else ""
+        fname = rel_path.split("/")[-1]
+        fid = next_cnid
+        next_cnid += 1
+        folders[parent_path]["children"].append(fname)
+
+        fblocks = max(1, (len(content) + block_size - 1) // block_size) if len(content) > 0 else 0
+        start_blk = next_data_block if fblocks > 0 else 0
+        next_data_block += fblocks
+
+        file_entries.append({
+            "id": fid,
+            "parent": folders[parent_path]["id"],
+            "name": fname,
+            "mode": mode,
+            "content": content,
+            "start_block": start_blk,
+            "block_count": fblocks,
+        })
+
+    catalog_items = []
+
+    for dpath, fobj in folders.items():
+        valence = len(fobj["children"])
+        is_bundle = fobj["name"].endswith(".app")
+        k_folder = (fobj["parent"], fobj["name"].lower(), make_catalog_key(fobj["parent"], fobj["name"]))
+        v_folder = make_folder_record(fobj["id"], valence, 0o040755, is_bundle)
+        catalog_items.append((k_folder[0], k_folder[1], k_folder[2] + v_folder))
+
+        k_thread = (fobj["id"], "", make_catalog_key(fobj["id"], ""))
+        v_thread = make_thread_record(True, fobj["parent"], fobj["name"])
+        catalog_items.append((k_thread[0], k_thread[1], k_thread[2] + v_thread))
+
+    for fe in file_entries:
+        k_file = (fe["parent"], fe["name"].lower(), make_catalog_key(fe["parent"], fe["name"]))
+        v_file = make_file_record(fe["id"], fe["mode"], len(fe["content"]), fe["start_block"], fe["block_count"])
+        catalog_items.append((k_file[0], k_file[1], k_file[2] + v_file))
+
+        k_thread = (fe["id"], "", make_catalog_key(fe["id"], ""))
+        v_thread = make_thread_record(False, fe["parent"], fe["name"])
+        catalog_items.append((k_thread[0], k_thread[1], k_thread[2] + v_thread))
+
+    catalog_items.sort(key=lambda x: (x[0], x[1]))
+    leaf_records = [item[2] for item in catalog_items]
+
+    cat_node_size = 8192
+    cat_node0 = make_btree_header_node(
+        tree_depth=1,
+        root_node=1,
+        leaf_records=len(leaf_records),
+        first_leaf=1,
+        last_leaf=1,
+        node_size=cat_node_size,
+        max_key_len=516,
+        total_nodes=2,
+        free_nodes=0,
+        key_compare_type=0,       # 0 for standard H+
+        attributes=0x00000006,    # kBTBigKeysMask | kBTVariableIndexKeysMask
+        alloc_bitmap_byte0=0xC0,
     )
-    koly[64:80] = uuid.uuid4().bytes
-    # dataForkChecksum at offset 80 (type=2, bit_size=32, crc32)
-    struct.pack_into(">III", koly, 80, 2, 32, data_crc)
-    # xmlOffset & xmlLength at offset 216
-    struct.pack_into(">QQ", koly, 216, xml_offset, xml_length)
-    # masterChecksum at offset 352
-    struct.pack_into(">III", koly, 352, 2, 32, master_crc)
-    # imageVariant & sectorCount at offset 488
-    struct.pack_into(">IQ", koly, 488, 1, total_sectors)
+    cat_node1 = pack_btree_node(-1, 1, leaf_records, cat_node_size)
+    catalog_btree_bytes = cat_node0 + cat_node1
+
+    ext_node0 = make_btree_header_node(
+        tree_depth=0,
+        root_node=0,
+        leaf_records=0,
+        first_leaf=0,
+        last_leaf=0,
+        node_size=4096,
+        max_key_len=10,
+        total_nodes=1,
+        free_nodes=0,
+        key_compare_type=0,
+        attributes=0x00000002,    # kBTBigKeysMask ONLY (variable index keys MUST be 0 for Extents B-Tree)
+        alloc_bitmap_byte0=0x80,
+    )
+
+    total_blocks = max(128, next_data_block + 16)
+    used_blocks_count = next_data_block + 1
+    free_blocks_count = total_blocks - used_blocks_count
+
+    alloc_bitmap = bytearray(block_size)
+    for b in range(next_data_block):
+        alloc_bitmap[b // 8] |= 1 << (7 - (b % 8))
+    last_blk = total_blocks - 1
+    alloc_bitmap[last_blk // 8] |= 1 << (7 - (last_blk % 8))
+
+    vh = bytearray(512)
+    header_80 = struct.pack(
+        ">2sHI4sIIIIIIIIIIIIIIIQ",
+        b"H+",
+        4,
+        0x00000100,  # kHFSVolumeUnmountedBit
+        b"10.0",
+        0,           # journalInfoBlock
+        HFS_TIME,
+        HFS_TIME,
+        HFS_TIME,
+        HFS_TIME,
+        len(file_entries),
+        len(folders) - 1,
+        block_size,
+        total_blocks,
+        free_blocks_count,
+        next_data_block,
+        65536,
+        65536,
+        next_cnid,
+        1,
+        1,           # encodingsBitmap
+    )
+    assert len(header_80) == 80
+    vh[0:80] = header_80
+    vh[112:192] = make_fork_data(block_size, block_size, 1, 1)
+    vh[192:272] = make_fork_data(block_size, block_size, 2, 1)
+    vh[272:352] = make_fork_data(16384, 16384, 3, 4)
+
+    vol = bytearray(total_blocks * block_size)
+    vol[1024:1536] = vh
+    vol[1 * block_size : 2 * block_size] = alloc_bitmap
+    vol[2 * block_size : 3 * block_size] = ext_node0
+    vol[3 * block_size : 7 * block_size] = catalog_btree_bytes
+
+    for fe in file_entries:
+        if fe["block_count"] > 0:
+            start_off = fe["start_block"] * block_size
+            vol[start_off : start_off + len(fe["content"])] = fe["content"]
+
+    vol[len(vol) - 1024 : len(vol) - 512] = vh
+    return bytes(vol)
+
+
+def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
+    """
+    将 HFS+ 分区封装进标准 GPT (GUID Partition Table) 磁盘映像 (.dmg, UDRW 格式)
+    macOS DiskImageMounter / IOGUIDPartitionScheme 原生识别并自动挂载 Apple_HFS 分区
+    """
+    hfs_sectors = len(hfs_volume_bytes) // 512
+    part_start_lba = 40
+    part_end_lba = part_start_lba + hfs_sectors - 1
+    total_sectors = part_start_lba + hfs_sectors + 40
+
+    disk = bytearray(total_sectors * 512)
+
+    # 1. LBA 0: Protective MBR
+    mbr = bytearray(512)
+    # Partition entry 1 at offset 446: type 0xEE (GPT Protective), start LBA 1
+    struct.pack_into("<BBBBBBBBII", mbr, 446, 0x00, 0x00, 0x02, 0x00, 0xEE, 0xFF, 0xFF, 0xFF, 1, total_sectors - 1)
+    mbr[510] = 0x55
+    mbr[511] = 0xAA
+    disk[0:512] = mbr
+
+    # 2. GPT Partition Entry Array (128 entries * 128 bytes = 16384 bytes = 32 sectors)
+    entries = bytearray(128 * 128)
+    apple_hfs_guid = uuid.UUID("48465300-0000-11aa-aa11-00306543ecac").bytes_le
+    part_guid = uuid.uuid4().bytes_le
+    part_name = "LanMediaController".encode("utf-16-le").ljust(72, b"\x00")
+    struct.pack_into("<16s16sQQQ72s", entries, 0, apple_hfs_guid, part_guid, part_start_lba, part_end_lba, 0, part_name)
+    entries_crc = zlib.crc32(entries) & 0xFFFFFFFF
+
+    # 写入主 GPT 分区表 (LBA 2..33) 与备份 GPT 分区表 (LBA total_sectors-33 .. total_sectors-2)
+    disk[2 * 512 : 34 * 512] = entries
+    backup_entries_lba = total_sectors - 33
+    disk[backup_entries_lba * 512 : (backup_entries_lba + 32) * 512] = entries
+
+    disk_guid = uuid.uuid4().bytes_le
+    first_usable_lba = 34
+    last_usable_lba = total_sectors - 34
+
+    def make_gpt_header(my_lba, alt_lba, part_entry_lba):
+        hdr = bytearray(92)
+        struct.pack_into(
+            "<8sIIIIQQQQ16sQIII",
+            hdr,
+            0,
+            b"EFI PART",
+            0x00010000,
+            92,
+            0,  # CRC32 placeholder
+            0,
+            my_lba,
+            alt_lba,
+            first_usable_lba,
+            last_usable_lba,
+            disk_guid,
+            part_entry_lba,
+            128,
+            128,
+            entries_crc,
+        )
+        hdr_crc = zlib.crc32(hdr) & 0xFFFFFFFF
+        struct.pack_into("<I", hdr, 16, hdr_crc)
+        sec = bytearray(512)
+        sec[0:92] = hdr
+        return bytes(sec)
+
+    # 主 GPT 头 (LBA 1) 与备份 GPT 头 (LBA total_sectors - 1)
+    disk[1 * 512 : 2 * 512] = make_gpt_header(1, total_sectors - 1, 2)
+    disk[(total_sectors - 1) * 512 : total_sectors * 512] = make_gpt_header(total_sectors - 1, 1, backup_entries_lba)
+
+    # 3. 写入 HFS+ 分区内容
+    disk[part_start_lba * 512 : (part_start_lba + hfs_sectors) * 512] = hfs_volume_bytes
 
     with open(out_dmg_path, "wb") as f:
-        f.write(data_fork)
-        f.write(xml_bytes)
-        f.write(koly)
+        f.write(disk)
 
 
 if __name__ == "__main__":
     app_files = build_macos_app_files()
-    iso_bytes = build_iso_with_rockridge(app_files)
+    hfs_bytes = build_hfsplus_volume(app_files)
     out_path = os.path.join(DIST_DIR, "LanMediaController-macOS.dmg")
-    wrap_in_udif_dmg(iso_bytes, out_path)
-    print(f"Built macOS DMG: {out_path} ({os.path.getsize(out_path)} bytes)")
+    wrap_in_gpt_disk_image(hfs_bytes, out_path)
+    print(f"Built GPT+HFS+ macOS DMG: {out_path} ({os.path.getsize(out_path)} bytes)")

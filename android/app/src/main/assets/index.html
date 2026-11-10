@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='28' fill='%231e3a8a'/%3E%3Cpath d='M36 42a46 46 0 0 1 56 0' stroke='%2334d399' stroke-width='8' stroke-linecap='round' fill='none'/%3E%3Cpath d='M46 54a30 30 0 0 1 36 0' stroke='%2334d399' stroke-width='8' stroke-linecap='round' fill='none'/%3E%3Ccircle cx='64' cy='78' r='24' fill='%233b82f6'/%3E%3Cpolygon points='57,67 57,89 76,78' fill='%23ffffff'/%3E%3C/svg%3E" />
   <title>四端媒体控制器</title>
   <style>
     :root {
@@ -473,12 +474,18 @@
 </head>
 <body>
   <div class="container">
-    <!-- 1. 页面最上方：显示当前局域网名称 -->
+    <!-- 1. 页面最上方：显示软件图标与当前局域网名称 -->
     <div class="lan-header">
       <div class="lan-info">
-        <div class="wifi-dot"></div>
+        <svg width="36" height="36" viewBox="0 0 128 128" style="flex-shrink:0; border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,0.3);">
+          <rect width="128" height="128" rx="28" fill="#1e3a8a"/>
+          <path d="M36 42a46 46 0 0 1 56 0" stroke="#34d399" stroke-width="8" stroke-linecap="round" fill="none"/>
+          <path d="M46 54a30 30 0 0 1 36 0" stroke="#34d399" stroke-width="8" stroke-linecap="round" fill="none"/>
+          <circle cx="64" cy="78" r="24" fill="#3b82f6"/>
+          <polygon points="57,67 57,89 76,78" fill="#ffffff"/>
+        </svg>
         <div>
-          <div class="lan-label">当前局域网</div>
+          <div class="lan-label" style="display:flex;align-items:center;gap:6px;"><span class="wifi-dot" style="width:8px;height:8px;"></span>当前局域网</div>
           <div class="lan-name" id="lanNameText">正在检测...</div>
         </div>
       </div>
