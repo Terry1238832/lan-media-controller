@@ -628,14 +628,46 @@
       return fetch(url, options);
     }
 
-    // 如果是 macOS 原生 App 容器 (WKWebView)，通过 document.title 桥接调用系统 AppleScript 控制播放器
+    let macCmdSeq = 0;
+    let lastManualCmdTime = 0;
+
+    // 如果是 macOS 原生 App 容器 (WKWebView)，通过 document.title 桥接调用系统底层媒体控制 (支持 QQ音乐/网易云/Apple Music/Spotify 等)
     function triggerMacNativeBridge(action, position) {
-      if (myPlatform === 'macos' && !hasLocalBackend) {
-        const prevTitle = document.title;
-        document.title = 'MAC_CMD:' + JSON.stringify({ action, position: position || 0, t: Date.now() });
-        setTimeout(() => { document.title = prevTitle || '四端媒体控制器'; }, 150);
+      if (myPlatform === 'macos') {
+        macCmdSeq += 1;
+        document.title = 'MAC_CMD:' + JSON.stringify({
+          seq: macCmdSeq,
+          action: action,
+          position: Math.round(Number(position) || 0),
+          t: Date.now()
+        });
       }
     }
+
+    // 接收来自 macOS 原生守护进程推送的实时系统媒体播放状态 (QQ音乐 / 网易云音乐 / Spotify / Apple Music)
+    window.__onNativeMediaState = function(st) {
+      if (!st) return;
+      const inGrace = (Date.now() - lastManualCmdTime) < 2200;
+      let changed = false;
+      if (st.title && st.title !== selfPlayer.title) {
+        selfPlayer.title = st.title;
+        changed = true;
+      }
+      if (!inGrace && typeof st.isPlaying === 'boolean' && st.isPlaying !== selfPlayer.isPlaying) {
+        selfPlayer.isPlaying = st.isPlaying;
+        changed = true;
+      }
+      if (typeof st.duration === 'number' && st.duration > 0) {
+        selfPlayer.duration = Math.round(st.duration);
+      }
+      if (!inGrace && typeof st.position === 'number' && st.position >= 0) {
+        selfPlayer.position = Math.round(st.position);
+      }
+      renderUI();
+      if (changed && currentRoomCode) {
+        broadcastMyRoomPresence(false);
+      }
+    };
 
     function applyLocalAction(player, action, position) {
       if (!player) return;
@@ -648,12 +680,16 @@
         player.isPlaying = true;
       } else if (action === 'next') {
         player.chapterIndex += 1;
-        player.title = `第 ${player.chapterIndex} 章`;
+        if (!player.title || /^第 \d+ 章$/.test(player.title)) {
+          player.title = `第 ${player.chapterIndex} 章`;
+        }
         player.position = 0;
         player.isPlaying = true;
       } else if (action === 'prev') {
         player.chapterIndex = Math.max(1, player.chapterIndex - 1);
-        player.title = `第 ${player.chapterIndex} 章`;
+        if (!player.title || /^第 \d+ 章$/.test(player.title)) {
+          player.title = `第 ${player.chapterIndex} 章`;
+        }
         player.position = 0;
         player.isPlaying = true;
       }
@@ -976,13 +1012,23 @@
     }
 
     async function sendCommand(targetDeviceId, action, position) {
+      lastManualCmdTime = Date.now();
+      let resolvedAction = action;
+      if (action === 'toggle') {
+        if (targetDeviceId === myDeviceId) {
+          resolvedAction = selfPlayer.isPlaying ? 'pause' : 'play';
+        } else if (roomPeersMap.has(targetDeviceId) && roomPeersMap.get(targetDeviceId).player) {
+          resolvedAction = roomPeersMap.get(targetDeviceId).player.isPlaying ? 'pause' : 'play';
+        }
+      }
+
       if (targetDeviceId === myDeviceId) {
-        applyLocalAction(selfPlayer, action, position);
-        triggerMacNativeBridge(action, position);
+        applyLocalAction(selfPlayer, resolvedAction, position);
+        triggerMacNativeBridge(resolvedAction, position);
         broadcastMyRoomPresence(false);
       } else {
         if (roomPeersMap.has(targetDeviceId)) {
-          applyLocalAction(roomPeersMap.get(targetDeviceId).player, action, position);
+          applyLocalAction(roomPeersMap.get(targetDeviceId).player, resolvedAction, position);
         }
         if (currentRoomCode) {
           const cmdId = `cmd_${myDeviceId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -993,7 +1039,7 @@
             ts: Date.now(),
             roomCode: currentRoomCode,
             targetDeviceId,
-            action,
+            action: resolvedAction,
             position
           });
         }
@@ -1004,13 +1050,12 @@
         await apiFetch('/api/control', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetDeviceId, action, position })
+          body: JSON.stringify({ targetDeviceId, action: resolvedAction, position })
         });
       } catch (e) {}
     }
 
     function getCombinedRoomDevices() {
-      if (!currentRoomCode) return [];
       const list = [{
         deviceId: myDeviceId,
         deviceName: myDeviceName,
@@ -1018,6 +1063,7 @@
         roomCode: currentRoomCode,
         player: selfPlayer
       }];
+      if (!currentRoomCode) return list;
       const seen = new Set([myDeviceId]);
       for (const peer of roomPeersMap.values()) {
         if (peer.roomCode === currentRoomCode && !seen.has(peer.deviceId)) {
@@ -1036,16 +1082,14 @@
 
       if (!currentRoomCode) {
         emptyHint.classList.remove('hidden');
-        emptyHint.textContent = '请先点击上方「独立开房间」生成 4 位数匹配码，或输入 4 位数匹配码「加入房间」';
-        container.innerHTML = '';
-        roomSectionLabel.textContent = '暂未加入房间';
-        roomCountLabel.textContent = '';
-        return;
+        emptyHint.textContent = '下方为本机媒体控制器（可直接控制 QQ音乐 / 网易云 / Spotify / Apple Music）；点击上方「独立开房间」或「加入房间」即可多端互控';
+        roomSectionLabel.textContent = '本机媒体播放器';
+        roomCountLabel.textContent = '本机直控模式';
+      } else {
+        emptyHint.classList.add('hidden');
+        roomSectionLabel.textContent = `房间 ${currentRoomCode} 内的设备播放器`;
+        roomCountLabel.textContent = `共 ${devices.length} 台设备`;
       }
-
-      emptyHint.classList.add('hidden');
-      roomSectionLabel.textContent = `房间 ${currentRoomCode} 内的设备播放器`;
-      roomCountLabel.textContent = `共 ${devices.length} 台设备`;
 
       const currentKeys = Array.from(container.children).map(el => el.dataset.key).join('|');
       const nextKeys = devices.map(d => d.deviceId).join('|');
@@ -1192,10 +1236,20 @@
         document.getElementById('lanIpText').textContent = data.localIp ? `${data.localIp}:${data.httpPort || 19889}` : PLATFORM_LABELS[myPlatform];
 
         if (data.selfDevice && data.selfDevice.player) {
-          selfPlayer = data.selfDevice.player;
+          const sp = data.selfDevice.player;
+          const inGrace = (Date.now() - lastManualCmdTime) < 2200;
+          const changed = (sp.title && sp.title !== selfPlayer.title) || (!inGrace && sp.isPlaying !== selfPlayer.isPlaying);
+          if (sp.title) selfPlayer.title = sp.title;
+          if (!inGrace) {
+            selfPlayer.isPlaying = Boolean(sp.isPlaying);
+            selfPlayer.position = Number(sp.position) || 0;
+          }
+          selfPlayer.duration = Number(sp.duration) || 300;
           if (data.selfDevice.roomCode && !currentRoomCode) {
             currentRoomCode = data.selfDevice.roomCode;
             connectRoomRelay(currentRoomCode);
+          } else if (changed && currentRoomCode) {
+            broadcastMyRoomPresence(false);
           }
         }
 

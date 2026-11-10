@@ -77,24 +77,30 @@ def poll_mac_wifi_name():
 def trigger_mac_media(action, position=0):
     if HOST_PLATFORM != "macos":
         return
-    script = ""
-    if action == "play":
-        script = 'tell application "Music" to play'
-    elif action == "pause":
-        script = 'tell application "Music" to pause'
-    elif action == "toggle":
-        script = 'tell application "Music" to playpause'
-    elif action == "next":
-        script = 'tell application "Music" to next track'
-    elif action == "prev":
-        script = 'tell application "Music" to previous track'
-    elif action == "seek":
-        script = f'tell application "Music"\nset player position to {float(position)}\nplay\nend tell'
-    if script:
-        try:
-            subprocess.Popen(["/usr/bin/osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+    pos = max(0, int(round(float(position or 0))))
+    jxa = f"""
+    ObjC.import('Foundation');
+    var b = $.NSBundle.bundleWithPath($('/System/Library/PrivateFrameworks/MediaRemote.framework'));
+    if (b && !b.isNil()) b.load;
+    ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
+    ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
+    var act = '{action}';
+    if (act === 'play') $.MRMediaRemoteSendCommand(0, null);
+    else if (act === 'pause') $.MRMediaRemoteSendCommand(1, null);
+    else if (act === 'toggle') $.MRMediaRemoteSendCommand(2, null);
+    else if (act === 'next') $.MRMediaRemoteSendCommand(4, null);
+    else if (act === 'prev') $.MRMediaRemoteSendCommand(5, null);
+    else if (act === 'seek') {{ $.MRMediaRemoteSetElapsedTime({pos}); $.MRMediaRemoteSendCommand(0, null); }}
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+    """
+    try:
+        subprocess.Popen(
+            ["/usr/bin/env", "-u", "__CFBundleIdentifier", "/usr/bin/osascript", "-l", "JavaScript", "-e", jxa],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def ensure_device(device_id, device_name=None, platform=None, is_host=False):

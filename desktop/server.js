@@ -278,22 +278,23 @@ async function pollMacState() {
 
 async function executeMacCommand(cmdObj) {
   const action = cmdObj.action;
-  const pos = Number(cmdObj.position) || 0;
-  let script = '';
-  if (action === 'play') script = 'tell application "Music" to play';
-  else if (action === 'pause') script = 'tell application "Music" to pause';
-  else if (action === 'toggle') script = 'tell application "Music" to playpause';
-  else if (action === 'next') script = 'tell application "Music" to next track';
-  else if (action === 'prev') script = 'tell application "Music" to previous track';
-  else if (action === 'seek') {
-    script = `tell application "Music"
-      set player position to ${pos}
-      play
-    end tell`;
-  }
-  if (script) {
-    await execPromise('/usr/bin/osascript', ['-e', script]);
-  }
+  const pos = Math.max(0, Math.round(Number(cmdObj.position) || 0));
+  const jxa = `
+    ObjC.import('Foundation');
+    var b = $.NSBundle.bundleWithPath($('/System/Library/PrivateFrameworks/MediaRemote.framework'));
+    if (b && !b.isNil()) b.load;
+    ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
+    ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
+    var act = ${JSON.stringify(action)};
+    if (act === 'play') $.MRMediaRemoteSendCommand(0, null);
+    else if (act === 'pause') $.MRMediaRemoteSendCommand(1, null);
+    else if (act === 'toggle') $.MRMediaRemoteSendCommand(2, null);
+    else if (act === 'next') $.MRMediaRemoteSendCommand(4, null);
+    else if (act === 'prev') $.MRMediaRemoteSendCommand(5, null);
+    else if (act === 'seek') { $.MRMediaRemoteSetElapsedTime(${pos}); $.MRMediaRemoteSendCommand(0, null); }
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+  `;
+  await execPromise('/usr/bin/env', ['-u', '__CFBundleIdentifier', '/usr/bin/osascript', '-l', 'JavaScript', '-e', jxa]);
 }
 
 // ============================================================================

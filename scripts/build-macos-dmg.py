@@ -3,8 +3,10 @@
 """
 构建 100% 符合 Apple TN1150 规范的 GPT + HFS+ (H+) macOS .dmg 磁盘映像
 内含：
-1. 原生 Cocoa (NSWindow + WKWebView) 桌面应用 LanMediaController.app（带自定义图标，非网页标签页）
+1. 原生 Cocoa (NSWindow + WKWebView) 桌面应用 LanMediaController.app（带自定义图标）
 2. 原生 HFS+ Applications 符号链接（支持将 LanMediaController.app 直接拖拽到 Applications 安装）
+3. macOS MediaRemote.framework + CGEventPost (NX_KEYTYPE_PLAY/NEXT/PREV) + coreaudiod/pmset 实时系统媒体识别与控制
+   （原生识别并控制 macOS 上的 QQ音乐、网易云音乐、Spotify、Apple Music、浏览器等所有播放器）
 """
 
 import os
@@ -40,48 +42,277 @@ def build_macos_app_files():
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "LanMediaController",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.3",
-        "CFBundleVersion": "4",
+        "CFBundleShortVersionString": "0.1.5",
+        "CFBundleVersion": "6",
         "LSMinimumSystemVersion": "10.15",
         "NSHighResolutionCapable": True,
         "NSAppTransportSecurity": {
             "NSAllowsArbitraryLoads": True
         },
         "NSLocalNetworkUsageDescription": "用于在局域网内发现并同步控制四端播放器",
-        "NSAppleEventsUsageDescription": "用于控制 macOS 音乐播放器播放、暂停、上下章与进度跳转"
+        "NSAppleEventsUsageDescription": "用于读取并控制 macOS 音乐播放器（QQ音乐、网易云音乐、Apple Music、Spotify）播放、暂停、上下章与进度跳转"
     })
 
+    mac_media_helper_sh = ("""#!/bin/bash
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+MODE="$1"
+
+if [ "$MODE" = "cmd" ]; then
+  ACTION="$2"
+  POS="${3:-0}"
+  /usr/bin/env -u __CFBundleIdentifier /usr/bin/osascript -l JavaScript -e '
+    ObjC.import("Cocoa");
+    var b = $.NSBundle.bundleWithPath($("/System/Library/PrivateFrameworks/MediaRemote.framework"));
+    if (b && !b.isNil()) b.load;
+    try {
+      ObjC.bindFunction("MRMediaRemoteSendCommand", ["bool", ["int", "id"]]);
+      ObjC.bindFunction("MRMediaRemoteSetElapsedTime", ["void", ["double"]]);
+    } catch (e) {}
+
+    var act = "'"$ACTION"'";
+    var pos = Number("'"$POS"'") || 0;
+    try {
+      if (act === "play") $.MRMediaRemoteSendCommand(0, null);
+      else if (act === "pause") $.MRMediaRemoteSendCommand(1, null);
+      else if (act === "toggle") $.MRMediaRemoteSendCommand(2, null);
+      else if (act === "next") $.MRMediaRemoteSendCommand(4, null);
+      else if (act === "prev") $.MRMediaRemoteSendCommand(5, null);
+      else if (act === "seek") {
+        $.MRMediaRemoteSetElapsedTime(pos);
+        $.MRMediaRemoteSendCommand(0, null);
+      }
+      $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.18));
+    } catch (e) {}
+  ' >/dev/null 2>&1
+  exit 0
+fi
+
+PARENT_PID="$2"
+STATE_FILE="/tmp/lmc_mac_media_state.json"
+
+while true; do
+  if [ -n "$PARENT_PID" ] && ! kill -0 "$PARENT_PID" 2>/dev/null; then
+    exit 0
+  fi
+
+  PMSET_OUT=$(/usr/bin/pmset -g assertions 2>/dev/null)
+  PMSET_PLAYING=0
+  PMSET_APP=""
+  if echo "$PMSET_OUT" | grep -qiE "QQMusic|QQ音乐"; then
+    PMSET_PLAYING=1
+    PMSET_APP="QQ音乐"
+  elif echo "$PMSET_OUT" | grep -qiE "NeteaseMusic|网易云"; then
+    PMSET_PLAYING=1
+    PMSET_APP="网易云音乐"
+  elif echo "$PMSET_OUT" | grep -qiE "Spotify"; then
+    PMSET_PLAYING=1
+    PMSET_APP="Spotify"
+  elif echo "$PMSET_OUT" | grep -qiE "Playing audio|audio-out|coreaudiod.*PreventUserIdleSystemSleep"; then
+    PMSET_PLAYING=1
+  fi
+
+  JSON_OUT=$(/usr/bin/env -u __CFBundleIdentifier /usr/bin/osascript -l JavaScript -e '
+    ObjC.import("Cocoa");
+    ObjC.import("CoreGraphics");
+    var b = $.NSBundle.bundleWithPath($("/System/Library/PrivateFrameworks/MediaRemote.framework"));
+    if (b && !b.isNil()) b.load;
+
+    var pmsetPlaying = Number("'"$PMSET_PLAYING"'") === 1;
+    var pmsetApp = "'"$PMSET_APP"'";
+
+    var appName = "";
+    var title = "";
+    var artist = "";
+    var isPlaying = null;
+    var duration = 0;
+    var position = -1;
+
+    try {
+      var reqCls = $.NSClassFromString($("MRNowPlayingRequest"));
+      if (reqCls && !reqCls.isNil()) {
+        if (reqCls.respondsToSelector("localIsPlaying")) {
+          isPlaying = Boolean(reqCls.localIsPlaying);
+        }
+        if (reqCls.respondsToSelector("localNowPlayingPlayerPath")) {
+          var ppath = reqCls.localNowPlayingPlayerPath;
+          if (ppath && !ppath.isNil() && ppath.respondsToSelector("client")) {
+            var client = ppath.client;
+            if (client && !client.isNil()) {
+              if (client.respondsToSelector("displayName") && client.displayName && !client.displayName.isNil()) {
+                appName = ObjC.unwrap(client.displayName);
+              } else if (client.respondsToSelector("bundleIdentifier") && client.bundleIdentifier && !client.bundleIdentifier.isNil()) {
+                appName = ObjC.unwrap(client.bundleIdentifier);
+              }
+            }
+          }
+        }
+        if (reqCls.respondsToSelector("localNowPlayingItem")) {
+          var item = reqCls.localNowPlayingItem;
+          if (item && !item.isNil() && item.respondsToSelector("metadata")) {
+            var meta = item.metadata;
+            if (meta && !meta.isNil()) {
+              if (meta.respondsToSelector("title") && meta.title && !meta.title.isNil()) {
+                title = ObjC.unwrap(meta.title);
+              }
+              if (meta.respondsToSelector("trackArtistName") && meta.trackArtistName && !meta.trackArtistName.isNil()) {
+                artist = ObjC.unwrap(meta.trackArtistName);
+              }
+              if (meta.respondsToSelector("duration")) {
+                var d = Number(meta.duration);
+                if (d > 0) duration = Math.round(d);
+              }
+              if (meta.respondsToSelector("calculatedPlaybackPosition")) {
+                var cp = Number(meta.calculatedPlaybackPosition);
+                if (cp >= 0) position = Math.round(cp);
+              } else if (meta.respondsToSelector("elapsedTime")) {
+                var ep = Number(meta.elapsedTime);
+                if (ep >= 0) position = Math.round(ep);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {}
+
+    if (appName.indexOf("QQMusic") >= 0 || appName.indexOf("qqmusic") >= 0) appName = "QQ音乐";
+    else if (appName.indexOf("163music") >= 0 || appName.indexOf("Netease") >= 0) appName = "网易云音乐";
+    else if (appName.indexOf("spotify") >= 0) appName = "Spotify";
+    else if (appName.indexOf("com.apple.Music") >= 0) appName = "Apple Music";
+
+    if (!appName && pmsetApp) appName = pmsetApp;
+
+    try {
+      var apps = $.NSWorkspace.sharedWorkspace.runningApplications;
+      var cnt = apps.count;
+      for (var i = 0; i < cnt; i++) {
+        var a = apps.objectAtIndex(i);
+        var bid = (a.bundleIdentifier && !a.bundleIdentifier.isNil()) ? ObjC.unwrap(a.bundleIdentifier) : "";
+        var lname = (a.localizedName && !a.localizedName.isNil()) ? ObjC.unwrap(a.localizedName) : "";
+        if (bid.indexOf("QQMusic") >= 0 || lname.indexOf("QQ音乐") >= 0 || lname.indexOf("QQMusic") >= 0) {
+          if (!appName) appName = "QQ音乐";
+          break;
+        }
+        if (bid.indexOf("163music") >= 0 || lname.indexOf("网易云") >= 0) {
+          if (!appName) appName = "网易云音乐";
+        }
+        if (bid.indexOf("com.spotify.client") >= 0) {
+          if (!appName) appName = "Spotify";
+        }
+      }
+    } catch (e) {}
+
+    if (!title && appName) {
+      try {
+        var winList = $.CGWindowListCopyWindowInfo(0, 0);
+        if (winList && !winList.isNil()) {
+          var wcnt = winList.count;
+          for (var j = 0; j < wcnt; j++) {
+            var w = winList.objectAtIndex(j);
+            var ownerObj = w.objectForKey("kCGWindowOwnerName");
+            var nameObj = w.objectForKey("kCGWindowName");
+            var owner = (ownerObj && !ownerObj.isNil()) ? ObjC.unwrap(ownerObj) : "";
+            var wname = (nameObj && !nameObj.isNil()) ? ObjC.unwrap(nameObj) : "";
+            if ((owner.indexOf("QQ音乐") >= 0 || owner.indexOf("QQMusic") >= 0 || owner.indexOf("网易云") >= 0) && wname) {
+              if (wname !== "QQ音乐" && wname !== "QQMusic" && wname !== "Window" && wname.indexOf("Item") !== 0) {
+                title = wname;
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    var finalPlaying = (isPlaying !== null) ? (isPlaying || pmsetPlaying) : pmsetPlaying;
+    var displayTitle = title;
+    if (artist) displayTitle = displayTitle ? (displayTitle + " - " + artist) : artist;
+    if (appName) {
+      if (displayTitle && displayTitle.indexOf(appName) < 0) {
+        displayTitle = appName + " · " + displayTitle;
+      } else if (!displayTitle) {
+        displayTitle = appName + (finalPlaying ? " · 正在播放" : " · 已就绪");
+      }
+    }
+
+    JSON.stringify({
+      appName: appName || "",
+      title: displayTitle || "",
+      isPlaying: Boolean(finalPlaying),
+      position: position,
+      duration: duration > 0 ? duration : 300,
+      ts: Date.now()
+    });
+  ' 2>/dev/null)
+
+  if [ -n "$JSON_OUT" ]; then
+    echo "$JSON_OUT" > "${STATE_FILE}.tmp" && mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
+  fi
+
+  sleep 1
+done
+""").encode("utf-8")
+
     mac_app_jxa = ("""ObjC.import('Cocoa');
+ObjC.import('CoreGraphics');
+ObjC.import('Quartz');
 ObjC.import('WebKit');
 ObjC.import('stdlib');
+
+var mrBundle = $.NSBundle.bundleWithPath($('/System/Library/PrivateFrameworks/MediaRemote.framework'));
+if (mrBundle && !mrBundle.isNil()) mrBundle.load;
+try {
+  ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
+  ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
+} catch (e) {}
 
 var G = {
   win: null,
   webView: null,
-  lastCmd: ''
+  resDir: '',
+  lastCmd: '',
+  nativeIsPlaying: false
 };
 
-function triggerAppleScriptMedia(action, pos) {
+function sendMacMediaKey(keyCode) {
+  try {
+    var d = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
+      14, $.NSMakePoint(0, 0), 0xa00, 0, 0, null, 8, (keyCode << 16) | (0xa << 8), -1
+    );
+    $.CGEventPost(0, d.CGEvent);
+    var u = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
+      14, $.NSMakePoint(0, 0), 0xb00, 0, 0, null, 8, (keyCode << 16) | (0xb << 8), -1
+    );
+    $.CGEventPost(0, u.CGEvent);
+  } catch (e) {}
+}
+
+function triggerMacMedia(action, pos) {
   var p = Math.max(0, Math.round(Number(pos) || 0));
-  var script = '';
-  if (action === 'play') {
-    script = 'if application "Music" is running then tell application "Music" to play\\nif application "Spotify" is running then tell application "Spotify" to play';
-  } else if (action === 'pause') {
-    script = 'if application "Music" is running then tell application "Music" to pause\\nif application "Spotify" is running then tell application "Spotify" to pause';
-  } else if (action === 'toggle') {
-    script = 'if application "Music" is running then tell application "Music" to playpause\\nif application "Spotify" is running then tell application "Spotify" to playpause';
-  } else if (action === 'next') {
-    script = 'if application "Music" is running then tell application "Music" to next track\\nif application "Spotify" is running then tell application "Spotify" to next track';
-  } else if (action === 'prev') {
-    script = 'if application "Music" is running then tell application "Music" to previous track\\nif application "Spotify" is running then tell application "Spotify" to previous track';
-  } else if (action === 'seek') {
-    script = 'if application "Music" is running then tell application "Music" to set player position to ' + p + '\\nif application "Spotify" is running then tell application "Spotify" to set player position to ' + p + '\\nif application "Music" is running then tell application "Music" to play\\nif application "Spotify" is running then tell application "Spotify" to play';
+  var targetAct = String(action || 'toggle');
+  if (targetAct === 'play' || targetAct === 'pause' || targetAct === 'toggle') {
+    targetAct = G.nativeIsPlaying ? 'pause' : 'play';
+    G.nativeIsPlaying = !G.nativeIsPlaying;
+    sendMacMediaKey(16);
+  } else if (targetAct === 'next') {
+    G.nativeIsPlaying = true;
+    sendMacMediaKey(17);
+  } else if (targetAct === 'prev') {
+    G.nativeIsPlaying = true;
+    sendMacMediaKey(18);
+  } else if (targetAct === 'seek') {
+    G.nativeIsPlaying = true;
+    try { $.MRMediaRemoteSetElapsedTime(p); } catch (e) {}
   }
-  if (!script) return;
+
+  try {
+    if (targetAct === 'play') $.MRMediaRemoteSendCommand(0, null);
+    else if (targetAct === 'pause') $.MRMediaRemoteSendCommand(1, null);
+  } catch (e) {}
+
   try {
     var task = $.NSTask.alloc.init;
-    task.setLaunchPath($('/usr/bin/osascript'));
-    task.setArguments($(['-e', script]));
+    task.setLaunchPath($('/bin/bash'));
+    task.setArguments($([G.resDir + '/desktop/mac_media_helper.sh', 'cmd', targetAct, String(p)]));
     task.launch;
   } catch (e) {}
 }
@@ -98,6 +329,7 @@ ObjC.registerSubclass({
         var ssidObj = env.objectForKey('LMC_WIFI_SSID');
         var resDir = (resDirObj && !resDirObj.isNil()) ? ObjC.unwrap(resDirObj) : '';
         var ssid = (ssidObj && !ssidObj.isNil()) ? ObjC.unwrap(ssidObj) : '';
+        G.resDir = resDir;
 
         var app = $.NSApplication.sharedApplication;
         app.setActivationPolicy($.NSApplicationActivationPolicyRegular);
@@ -149,7 +381,8 @@ ObjC.registerSubclass({
           wv.loadHTMLStringBaseURL($(htmlStr), $.NSURL.URLWithString($('https://ntfy.sh/')));
         }
 
-        $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(0.25, this, 'pollTitle:', null, true);
+        $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(0.08, this, 'pollTitle:', null, true);
+        $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(0.6, this, 'pollMediaState:', null, true);
 
         win.makeKeyAndOrderFront(null);
         app.activateIgnoringOtherApps(true);
@@ -167,10 +400,30 @@ ObjC.registerSubclass({
             G.lastCmd = t;
             try {
               var cmd = JSON.parse(t.slice(8));
-              triggerAppleScriptMedia(cmd.action, cmd.position);
+              triggerMacMedia(cmd.action, cmd.position);
             } catch (e) {}
           }
         }
+      }
+    },
+    'pollMediaState:': {
+      types: ['void', ['id']],
+      implementation: function(timer) {
+        if (!G.webView) return;
+        try {
+          var nsState = $.NSString.stringWithContentsOfFileEncodingError($('/tmp/lmc_mac_media_state.json'), $.NSUTF8StringEncoding, null);
+          if (nsState && !nsState.isNil()) {
+            var jsonStr = ObjC.unwrap(nsState).trim();
+            if (jsonStr) {
+              try {
+                var parsed = JSON.parse(jsonStr);
+                if (typeof parsed.isPlaying === 'boolean') G.nativeIsPlaying = parsed.isPlaying;
+              } catch (e) {}
+              var js = 'if (window.__onNativeMediaState) { window.__onNativeMediaState(' + jsonStr + '); }';
+              G.webView.evaluateJavaScriptCompletionHandler($(js), null);
+            }
+          }
+        } catch (e) {}
       }
     },
     'windowWillClose:': {
@@ -211,6 +464,9 @@ fi
 export LMC_RES_DIR="$DIR"
 export LMC_WIFI_SSID="$SSID"
 
+pkill -f "mac_media_helper.sh" 2>/dev/null
+nohup /bin/bash "$DIR/desktop/mac_media_helper.sh" daemon $$ >/dev/null 2>&1 &
+
 OLD_PID=$(lsof -ti tcp:19889 2>/dev/null)
 if [ -n "$OLD_PID" ]; then
   kill -9 $OLD_PID 2>/dev/null
@@ -231,7 +487,7 @@ exec /usr/bin/osascript -l JavaScript "$DIR/desktop/mac_app.jxa"
         "安装与使用方法：\n"
         "1. 将磁盘映像内的 LanMediaController.app 直接拖拽到旁边的 Applications (应用程序) 文件夹中完成安装。\n"
         "2. 在「应用程序 (Applications)」中双击打开 LanMediaController.app（若首次打开提示未签名应用，请右键点击图标 -> 选择「打开」）。\n"
-        "3. 软件将以原生 macOS 桌面应用窗口运行，输入设备名称并点击「独立开房间」或输入 4 位数匹配码「加入房间」即可与 Windows / iOS / Android 实时互控。\n"
+        "3. 原生支持识别并控制 macOS 上的 QQ音乐、网易云音乐、Apple Music、Spotify 等播放器。\n"
     ).encode("utf-8")
 
     return {
@@ -240,6 +496,7 @@ exec /usr/bin/osascript -l JavaScript "$DIR/desktop/mac_app.jxa"
         "LanMediaController.app/Contents/MacOS/LanMediaController": (launcher_sh, 0o100755),
         "LanMediaController.app/Contents/Resources/AppIcon.icns": (app_icns, 0o100644),
         "LanMediaController.app/Contents/Resources/desktop/mac_app.jxa": (mac_app_jxa, 0o100644),
+        "LanMediaController.app/Contents/Resources/desktop/mac_media_helper.sh": (mac_media_helper_sh, 0o100755),
         "LanMediaController.app/Contents/Resources/desktop/server.js": (server_js, 0o100644),
         "LanMediaController.app/Contents/Resources/desktop/server.py": (server_py, 0o100755),
         "LanMediaController.app/Contents/Resources/ui/index.html": (index_html, 0o100644),
@@ -271,14 +528,13 @@ def make_unistr255(name_str):
 def make_folder_record(folder_id, valence, mode=0o040755, is_bundle=False):
     flags = 0
     bsd = struct.pack(">IIBBHI", 0, 0, 0, 0, mode, 0)
-    # Set kHasBundle (0x2000) in FolderInfo.finderFlags for .app bundle
     finder_flags = 0x2000 if is_bundle else 0
     user_info = struct.pack(">hhhhH6s", 0, 0, 0, 0, finder_flags, b"\x00" * 6)
     finder_info = b"\x00" * 16
     res = (
         struct.pack(
             ">hHIIIIIII",
-            1,          # kHFSPlusFolderRecord
+            1,
             flags,
             valence,
             folder_id,
@@ -299,7 +555,6 @@ def make_folder_record(folder_id, valence, mode=0o040755, is_bundle=False):
 
 def make_file_record(file_id, mode, logical_size, start_block, block_count):
     bsd = struct.pack(">IIBBHI", 0, 0, 0, 0, mode, 0)
-    # Symlink in HFS+ (TN1150) requires fdType='slnk' and fdCreator='rhap'
     if (mode & 0o170000) == 0o120000:
         user_info = struct.pack(">4s4sHhhh", b"slnk", b"rhap", 0, 0, 0, 0)
     else:
@@ -310,8 +565,8 @@ def make_file_record(file_id, mode, logical_size, start_block, block_count):
     res = (
         struct.pack(
             ">hHIIIIIII",
-            2,          # kHFSPlusFileRecord
-            2,          # kHFSThreadExistsMask
+            2,
+            2,
             0,
             file_id,
             HFS_TIME,
@@ -474,8 +729,8 @@ def build_hfsplus_volume(files_map, volume_name="LanMediaController"):
         max_key_len=516,
         total_nodes=2,
         free_nodes=0,
-        key_compare_type=0,       # 0 for standard H+
-        attributes=0x00000006,    # kBTBigKeysMask | kBTVariableIndexKeysMask
+        key_compare_type=0,
+        attributes=0x00000006,
         alloc_bitmap_byte0=0xC0,
     )
     cat_node1 = pack_btree_node(-1, 1, leaf_records, cat_node_size)
@@ -492,7 +747,7 @@ def build_hfsplus_volume(files_map, volume_name="LanMediaController"):
         total_nodes=1,
         free_nodes=0,
         key_compare_type=0,
-        attributes=0x00000002,    # kBTBigKeysMask ONLY (variable index keys MUST be 0 for Extents B-Tree)
+        attributes=0x00000002,
         alloc_bitmap_byte0=0x80,
     )
 
@@ -511,9 +766,9 @@ def build_hfsplus_volume(files_map, volume_name="LanMediaController"):
         ">2sHI4sIIIIIIIIIIIIIIIQ",
         b"H+",
         4,
-        0x00000100,  # kHFSVolumeUnmountedBit
+        0x00000100,
         b"10.0",
-        0,           # journalInfoBlock
+        0,
         HFS_TIME,
         HFS_TIME,
         HFS_TIME,
@@ -528,7 +783,7 @@ def build_hfsplus_volume(files_map, volume_name="LanMediaController"):
         65536,
         next_cnid,
         1,
-        1,           # encodingsBitmap
+        1,
     )
     assert len(header_80) == 80
     vh[0:80] = header_80
@@ -552,10 +807,6 @@ def build_hfsplus_volume(files_map, volume_name="LanMediaController"):
 
 
 def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
-    """
-    将 HFS+ 分区封装进标准 GPT (GUID Partition Table) 磁盘映像 (.dmg, UDRW 格式)
-    macOS DiskImageMounter / IOGUIDPartitionScheme 原生识别并自动挂载 Apple_HFS 分区
-    """
     hfs_sectors = len(hfs_volume_bytes) // 512
     part_start_lba = 40
     part_end_lba = part_start_lba + hfs_sectors - 1
@@ -563,14 +814,12 @@ def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
 
     disk = bytearray(total_sectors * 512)
 
-    # 1. LBA 0: Protective MBR
     mbr = bytearray(512)
     struct.pack_into("<BBBBBBBBII", mbr, 446, 0x00, 0x00, 0x02, 0x00, 0xEE, 0xFF, 0xFF, 0xFF, 1, total_sectors - 1)
     mbr[510] = 0x55
     mbr[511] = 0xAA
     disk[0:512] = mbr
 
-    # 2. GPT Partition Entry Array (128 entries * 128 bytes = 16384 bytes = 32 sectors)
     entries = bytearray(128 * 128)
     apple_hfs_guid = uuid.UUID("48465300-0000-11aa-aa11-00306543ecac").bytes_le
     part_guid = uuid.uuid4().bytes_le
@@ -595,7 +844,7 @@ def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
             b"EFI PART",
             0x00010000,
             92,
-            0,  # CRC32 placeholder
+            0,
             0,
             my_lba,
             alt_lba,
@@ -616,7 +865,6 @@ def wrap_in_gpt_disk_image(hfs_volume_bytes, out_dmg_path):
     disk[1 * 512 : 2 * 512] = make_gpt_header(1, total_sectors - 1, 2)
     disk[(total_sectors - 1) * 512 : total_sectors * 512] = make_gpt_header(total_sectors - 1, 1, backup_entries_lba)
 
-    # 3. 写入 HFS+ 分区内容
     disk[part_start_lba * 512 : (part_start_lba + hfs_sectors) * 512] = hfs_volume_bytes
 
     with open(out_dmg_path, "wb") as f:

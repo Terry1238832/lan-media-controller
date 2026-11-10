@@ -246,12 +246,60 @@ namespace LanMediaController
                             try
                             {
                                 var dict = jss.Deserialize<Dictionary<string, object>>(line);
-                                if (dict != null && dict.ContainsKey("lanName"))
+                                if (dict != null)
                                 {
-                                    string ln = Convert.ToString(dict["lanName"]);
-                                    if (!string.IsNullOrWhiteSpace(ln) && ln != "Local Network")
+                                    if (dict.ContainsKey("lanName"))
                                     {
-                                        LocalLanName = ln;
+                                        string ln = Convert.ToString(dict["lanName"]);
+                                        if (!string.IsNullOrWhiteSpace(ln) && ln != "Local Network")
+                                        {
+                                            LocalLanName = ln;
+                                        }
+                                    }
+                                    if (dict.ContainsKey("players") && dict["players"] is System.Collections.IEnumerable)
+                                    {
+                                        Dictionary<string, object> bestP = null;
+                                        foreach (var item in (System.Collections.IEnumerable)dict["players"])
+                                        {
+                                            var pDict = item as Dictionary<string, object>;
+                                            if (pDict == null) continue;
+                                            string pId = pDict.ContainsKey("playerId") ? Convert.ToString(pDict["playerId"]) : "";
+                                            if (pId == "system" && string.IsNullOrEmpty(Convert.ToString(pDict.ContainsKey("title") ? pDict["title"] : ""))) continue;
+                                            bool playing = pDict.ContainsKey("isPlaying") && Convert.ToBoolean(pDict["isPlaying"]);
+                                            if (bestP == null || playing)
+                                            {
+                                                bestP = pDict;
+                                                if (playing) break;
+                                            }
+                                        }
+                                        if (bestP != null)
+                                        {
+                                            string appName = bestP.ContainsKey("appName") ? Convert.ToString(bestP["appName"]) : "";
+                                            string title = bestP.ContainsKey("title") ? Convert.ToString(bestP["title"]) : "";
+                                            string artist = bestP.ContainsKey("artist") ? Convert.ToString(bestP["artist"]) : "";
+                                            bool isPlaying = bestP.ContainsKey("isPlaying") && Convert.ToBoolean(bestP["isPlaying"]);
+                                            double pos = bestP.ContainsKey("position") ? Convert.ToDouble(bestP["position"]) : 0;
+                                            double dur = bestP.ContainsKey("duration") ? Convert.ToDouble(bestP["duration"]) : 300;
+                                            if (dur <= 0) dur = 300;
+
+                                            string fullTitle = title;
+                                            if (!string.IsNullOrEmpty(artist)) fullTitle = fullTitle + " - " + artist;
+                                            if (!string.IsNullOrEmpty(appName) && !fullTitle.Contains(appName))
+                                            {
+                                                fullTitle = string.IsNullOrEmpty(fullTitle) ? appName : (appName + " \u00b7 " + fullTitle);
+                                            }
+
+                                            foreach (var d in DevicesMap.Values)
+                                            {
+                                                if (d.isNativeHost && d.player != null)
+                                                {
+                                                    if (!string.IsNullOrEmpty(fullTitle)) d.player.title = fullTitle;
+                                                    d.player.isPlaying = isPlaying;
+                                                    if (pos > 0 || !isPlaying) d.player.position = Math.Round(pos);
+                                                    d.player.duration = Math.Round(dur);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

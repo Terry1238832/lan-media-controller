@@ -138,6 +138,25 @@ function Get-StateJson {
     }
 
     if ($players.Count -eq 0) {
+        try {
+            $win32Procs = Get-Process -Name QQMusic, cloudmusic, Spotify, AppleMusic, PotPlayerMini64, vlc -ErrorAction SilentlyContinue
+            foreach ($wp in $win32Procs) {
+                if (-not [string]::IsNullOrWhiteSpace($wp.MainWindowTitle)) {
+                    $players += @{
+                        playerId  = $wp.ProcessName
+                        appName   = (Format-AppName $wp.ProcessName)
+                        title     = [string]$wp.MainWindowTitle
+                        artist    = ""
+                        isPlaying = $true
+                        position  = 0
+                        duration  = 300
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    if ($players.Count -eq 0) {
         $players += @{
             playerId  = "system"
             appName   = "Windows Player"
