@@ -1049,6 +1049,8 @@ const server = http.createServer(async (req, res) => {
       const code = generateFourDigitRoomCode();
       activeRooms.add(code);
       dev.roomCode = code;
+      const hostDev = ensureDevice(HOST_DEVICE_ID, { isNativeHost: true });
+      hostDev.roomCode = code;
       broadcastStateNow();
       return sendJson(res, 200, {
         ok: true,
@@ -1075,6 +1077,8 @@ const server = http.createServer(async (req, res) => {
       });
       activeRooms.add(code);
       dev.roomCode = code;
+      const hostDev = ensureDevice(HOST_DEVICE_ID, { isNativeHost: true });
+      hostDev.roomCode = code;
       broadcastStateNow();
       return sendJson(res, 200, {
         ok: true,
@@ -1094,6 +1098,8 @@ const server = http.createServer(async (req, res) => {
       if (!body.deviceId) return sendJson(res, 400, { ok: false, error: '缺少 deviceId' });
       const dev = ensureDevice(body.deviceId);
       dev.roomCode = '';
+      const hostDev = ensureDevice(HOST_DEVICE_ID, { isNativeHost: true });
+      hostDev.roomCode = '';
       broadcastStateNow();
       return sendJson(res, 200, { ok: true, selfDevice: dev });
     } catch (e) {
@@ -1184,6 +1190,7 @@ setInterval(async () => {
   broadcastStateNow();
 }, 1500);
 
+ensureDevice(HOST_DEVICE_ID, { platform: HOST_PLATFORM, isNativeHost: true });
 refreshLocalState().then(() => broadcastStateNow());
 
 server.on('error', (err) => {

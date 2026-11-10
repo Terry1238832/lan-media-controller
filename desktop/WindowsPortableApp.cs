@@ -634,6 +634,8 @@ namespace LanMediaController
                             lock (Rng) { code = Rng.Next(1000, 10000).ToString(); }
                             ActiveRooms[code] = true;
                             dev.roomCode = code;
+                            DeviceRecord hostDev1;
+                            if (DevicesMap.TryGetValue(HostDeviceId, out hostDev1)) hostDev1.roomCode = code;
                             BroadcastUdpState();
                             WriteHttpResponse(stream, "200 OK", "application/json; charset=utf-8", jss.Serialize(new { ok = true, roomCode = code, selfDevice = dev }));
                             return;
@@ -649,6 +651,8 @@ namespace LanMediaController
                             var dev = EnsureDevice(devId, devName, plat, false);
                             ActiveRooms[code] = true;
                             dev.roomCode = code;
+                            DeviceRecord hostDev2;
+                            if (DevicesMap.TryGetValue(HostDeviceId, out hostDev2)) hostDev2.roomCode = code;
                             BroadcastUdpState();
                             WriteHttpResponse(stream, "200 OK", "application/json; charset=utf-8", jss.Serialize(new { ok = true, roomCode = code, selfDevice = dev }));
                             return;
@@ -660,6 +664,8 @@ namespace LanMediaController
                             string devId = data.ContainsKey("deviceId") ? Convert.ToString(data["deviceId"]) : HostDeviceId;
                             var dev = EnsureDevice(devId, "", "", false);
                             dev.roomCode = "";
+                            DeviceRecord hostDev3;
+                            if (DevicesMap.TryGetValue(HostDeviceId, out hostDev3)) hostDev3.roomCode = "";
                             BroadcastUdpState();
                             WriteHttpResponse(stream, "200 OK", "application/json; charset=utf-8", jss.Serialize(new { ok = true, selfDevice = dev }));
                             return;

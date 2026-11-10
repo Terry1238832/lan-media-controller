@@ -621,6 +621,8 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 active_rooms.add(code)
                 dev["roomCode"] = code
+                if HOST_DEVICE_ID in devices_map:
+                    devices_map[HOST_DEVICE_ID]["roomCode"] = code
             broadcast_state_now()
             return self._send_json(200, {"ok": True, "roomCode": code, "selfDevice": dev})
 
@@ -630,6 +632,8 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 active_rooms.add(code)
                 dev["roomCode"] = code
+                if HOST_DEVICE_ID in devices_map:
+                    devices_map[HOST_DEVICE_ID]["roomCode"] = code
             broadcast_state_now()
             return self._send_json(200, {"ok": True, "roomCode": code, "selfDevice": dev})
 
@@ -637,6 +641,8 @@ class Handler(BaseHTTPRequestHandler):
             dev = ensure_device(body.get("deviceId") or HOST_DEVICE_ID)
             with lock:
                 dev["roomCode"] = ""
+                if HOST_DEVICE_ID in devices_map:
+                    devices_map[HOST_DEVICE_ID]["roomCode"] = ""
             broadcast_state_now()
             return self._send_json(200, {"ok": True, "selfDevice": dev})
 
