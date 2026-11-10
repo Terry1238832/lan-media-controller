@@ -40,11 +40,98 @@ let hostSystemPlayer = {
  */
 const devicesMap = new Map();
 
-// 局域网 UDP 发现的远端设备表: Map<deviceId, DeviceRecord>
+// 局域网 UDP/HTTP 发现的远端设备表: Map<deviceId, DeviceRecord>
 const remoteLanDevices = new Map();
 
 // 已创建的有效房间号集合: Set<string>
 const activeRooms = new Set();
+
+// 已发现的对端主机 IP 集合与待发指令队列 (用于双向 HTTP /api/lan-sync 穿透单向防火墙)
+const knownPeerIps = new Set();
+const pendingPeerCommands = [];
+
+function ingestRemoteSyncPayload(data, senderIp) {
+  if (!data || data.senderHostId === HOST_DEVICE_ID) return;
+  if (senderIp && senderIp !== '127.0.0.1' && senderIp !== '::1') {
+    knownPeerIps.add(senderIp);
+  }
+  if (Array.isArray(data.rooms)) {
+    for (const r of data.rooms) {
+      if (/^\d{4}$/.test(String(r))) activeRooms.add(String(r));
+    }
+  }
+  if (Array.isArray(data.devices)) {
+    for (const dev of data.devices) {
+      if (dev.deviceId && !devicesMap.has(dev.deviceId)) {
+        remoteLanDevices.set(dev.deviceId, {
+          deviceId: dev.deviceId,
+          deviceName: dev.deviceName || '远端设备',
+          platform: dev.platform || 'windows',
+          roomCode: String(dev.roomCode || ''),
+          ip: dev.ip || senderIp,
+          httpPort: dev.httpPort || HTTP_PORT,
+          player: {
+            title: dev.player?.title || '第 1 章',
+            isPlaying: Boolean(dev.player?.isPlaying),
+            position: Number(dev.player?.position) || 0,
+            duration: Number(dev.player?.duration) || 300,
+            chapterIndex: Number(dev.player?.chapterIndex) || 1
+          },
+          lastSeen: Date.now()
+        });
+        if (dev.roomCode && /^\d{4}$/.test(String(dev.roomCode))) {
+          activeRooms.add(String(dev.roomCode));
+        }
+      }
+    }
+  }
+  if (Array.isArray(data.pendingCommands)) {
+    for (const cmd of data.pendingCommands) {
+      const localTarget = devicesMap.get(cmd.targetDeviceId);
+      if (localTarget) {
+        applyActionToPlayer(localTarget.player, cmd);
+        if (localTarget.isNativeHost) {
+          triggerHostOSMedia(cmd);
+        }
+      }
+    }
+  }
+}
+
+function buildLocalSyncPayload(includeCommandsForIp = null) {
+  const { primaryIp } = getNetworkAddresses();
+  const localList = Array.from(devicesMap.values()).map(d => ({
+    deviceId: d.deviceId,
+    deviceName: d.deviceName,
+    platform: d.platform,
+    roomCode: d.roomCode,
+    ip: primaryIp,
+    httpPort: HTTP_PORT,
+    player: d.player
+  }));
+
+  let cmds = [];
+  if (includeCommandsForIp) {
+    for (let i = pendingPeerCommands.length - 1; i >= 0; i--) {
+      if (pendingPeerCommands[i].ip === includeCommandsForIp) {
+        cmds.push(pendingPeerCommands[i]);
+        pendingPeerCommands.splice(i, 1);
+      }
+    }
+  }
+
+  return {
+    type: 'lan_sync',
+    senderHostId: HOST_DEVICE_ID,
+    lanName: localLanName,
+    ip: primaryIp,
+    httpPort: HTTP_PORT,
+    rooms: Array.from(activeRooms),
+    devices: localList,
+    pendingCommands: cmds,
+    timestamp: Date.now()
+  };
+}
 
 function getNetworkAddresses() {
   const interfaces = os.networkInterfaces();
@@ -350,61 +437,79 @@ setInterval(() => {
 const udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
 function broadcastStateNow() {
-  const { primaryIp, broadcasts } = getNetworkAddresses();
-  const localList = Array.from(devicesMap.values()).map(d => ({
-    deviceId: d.deviceId,
-    deviceName: d.deviceName,
-    platform: d.platform,
-    roomCode: d.roomCode,
-    ip: primaryIp,
-    httpPort: HTTP_PORT,
-    player: d.player
-  }));
-
-  const packet = Buffer.from(JSON.stringify({
-    type: 'lan_sync',
-    senderHostId: HOST_DEVICE_ID,
-    lanName: localLanName,
-    ip: primaryIp,
-    httpPort: HTTP_PORT,
-    rooms: Array.from(activeRooms),
-    devices: localList,
-    timestamp: Date.now()
-  }), 'utf8');
-
+  const { broadcasts } = getNetworkAddresses();
+  const payload = Buffer.from(JSON.stringify(buildLocalSyncPayload()), 'utf8');
   for (const bcastAddr of broadcasts) {
-    udpSocket.send(packet, 0, packet.length, UDP_PORT, bcastAddr, () => {});
+    udpSocket.send(payload, 0, payload.length, UDP_PORT, bcastAddr, () => {});
+  }
+  for (const peerIp of knownPeerIps) {
+    udpSocket.send(payload, 0, payload.length, UDP_PORT, peerIp, () => {});
+    syncWithHttpPeer(peerIp);
   }
 }
+
+function syncWithHttpPeer(peerIp) {
+  const { primaryIp } = getNetworkAddresses();
+  if (!peerIp || peerIp === primaryIp || peerIp === '127.0.0.1') return;
+
+  const postData = JSON.stringify(buildLocalSyncPayload(peerIp));
+  const req = http.request({
+    hostname: peerIp,
+    port: HTTP_PORT,
+    path: '/api/lan-sync',
+    method: 'POST',
+    timeout: 800,
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData)
+    }
+  }, (res) => {
+    let raw = '';
+    res.on('data', chunk => { raw += chunk; });
+    res.on('end', () => {
+      try {
+        const reply = JSON.parse(raw);
+        if (reply && reply.senderHostId) {
+          ingestRemoteSyncPayload(reply, peerIp);
+        }
+      } catch (e) {}
+    });
+  });
+  req.on('error', () => {});
+  req.on('timeout', () => { req.destroy(); });
+  req.write(postData);
+  req.end();
+}
+
+// 主动扫描本机所在 /24 网段的 19889 端口对端节点 (彻底解决路由器拦截 UDP 广播或单向防火墙问题)
+function scanSubnetForPeers() {
+  const { primaryIp } = getNetworkAddresses();
+  const parts = primaryIp.split('.');
+  if (parts.length !== 4 || primaryIp === '127.0.0.1') return;
+  const prefix = `${parts[0]}.${parts[1]}.${parts[2]}.`;
+  const selfLast = Number(parts[3]);
+
+  for (let i = 1; i <= 254; i++) {
+    if (i === selfLast) continue;
+    const targetIp = `${prefix}${i}`;
+    setTimeout(() => {
+      syncWithHttpPeer(targetIp);
+    }, (i % 25) * 40);
+  }
+}
+
+setTimeout(scanSubnetForPeers, 500);
+setInterval(scanSubnetForPeers, 8000);
 
 udpSocket.on('message', (msg, rinfo) => {
   try {
     const data = JSON.parse(msg.toString('utf8'));
     if (!data || !data.type) return;
+    const senderIp = (data.ip || rinfo.address || '').replace('::ffff:', '');
 
-    // 兼容多节点房间同步包
-    if (data.type === 'lan_sync' && data.senderHostId !== HOST_DEVICE_ID) {
-      if (Array.isArray(data.rooms)) {
-        for (const r of data.rooms) {
-          if (/^\d{4}$/.test(String(r))) activeRooms.add(String(r));
-        }
-      }
-      if (Array.isArray(data.devices)) {
-        for (const dev of data.devices) {
-          if (dev.deviceId && !devicesMap.has(dev.deviceId)) {
-            remoteLanDevices.set(dev.deviceId, {
-              ...dev,
-              ip: dev.ip || rinfo.address,
-              lastSeen: Date.now()
-            });
-            if (dev.roomCode && /^\d{4}$/.test(dev.roomCode)) {
-              activeRooms.add(dev.roomCode);
-            }
-          }
-        }
-      }
+    if (data.type === 'lan_sync') {
+      ingestRemoteSyncPayload(data, senderIp);
     } else if (data.type === 'state' && data.deviceId && !devicesMap.has(data.deviceId)) {
-      // 兼容 iOS / Android 原生端直接广播的单设备数据包
       const p0 = (Array.isArray(data.players) && data.players[0]) || data.player || {};
       const roomCode = String(data.roomCode || '');
       if (/^\d{4}$/.test(roomCode)) activeRooms.add(roomCode);
@@ -413,7 +518,7 @@ udpSocket.on('message', (msg, rinfo) => {
         deviceName: data.deviceName || data.platform || '移动设备',
         platform: data.platform || 'ios',
         roomCode: roomCode,
-        ip: data.ip || rinfo.address,
+        ip: senderIp,
         httpPort: data.httpPort || HTTP_PORT,
         player: {
           title: p0.title || '第 1 章',
@@ -477,6 +582,12 @@ async function dispatchControlCommand(cmd) {
   const remoteDev = remoteLanDevices.get(targetId);
   if (remoteDev) {
     applyActionToPlayer(remoteDev.player, cmd);
+    pendingPeerCommands.push({
+      ip: remoteDev.ip,
+      targetDeviceId: targetId,
+      action: cmd.action,
+      position: cmd.position
+    });
     const udpPayload = Buffer.from(JSON.stringify({
       type: 'command',
       targetDeviceId: targetId,
@@ -484,6 +595,7 @@ async function dispatchControlCommand(cmd) {
       position: cmd.position
     }), 'utf8');
     udpSocket.send(udpPayload, 0, udpPayload.length, UDP_PORT, remoteDev.ip, () => {});
+    syncWithHttpPeer(remoteDev.ip);
 
     const postData = JSON.stringify(cmd);
     const req = http.request({
@@ -657,6 +769,18 @@ const server = http.createServer(async (req, res) => {
       const cmd = await readJsonBody(req);
       const result = await dispatchControlCommand(cmd);
       return sendJson(res, 200, result);
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: e.message });
+    }
+  }
+
+  // 7) 跨主机 HTTP 双向状态与房间同步接口 (穿透路由器 UDP 广播隔离与单向防火墙)
+  if (req.method === 'POST' && urlObj.pathname === '/api/lan-sync') {
+    try {
+      const body = await readJsonBody(req);
+      const senderIp = (body.ip || req.socket.remoteAddress || '').replace('::ffff:', '');
+      ingestRemoteSyncPayload(body, senderIp);
+      return sendJson(res, 200, buildLocalSyncPayload(senderIp));
     } catch (e) {
       return sendJson(res, 400, { ok: false, error: e.message });
     }

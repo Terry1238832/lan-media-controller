@@ -48,6 +48,8 @@ namespace LanMediaController
         private static readonly ConcurrentDictionary<string, DeviceRecord> DevicesMap = new ConcurrentDictionary<string, DeviceRecord>();
         private static readonly ConcurrentDictionary<string, DeviceRecord> RemoteLanDevices = new ConcurrentDictionary<string, DeviceRecord>();
         private static readonly ConcurrentDictionary<string, bool> ActiveRooms = new ConcurrentDictionary<string, bool>();
+        private static readonly ConcurrentDictionary<string, bool> KnownPeerIps = new ConcurrentDictionary<string, bool>();
+        private static readonly ConcurrentQueue<Dictionary<string, object>> PendingPeerCommands = new ConcurrentQueue<Dictionary<string, object>>();
 
         private static string LocalLanName = "\u672c\u5730\u5c40\u57df\u7f51";
         private static string EmbeddedHtml = "";
@@ -84,8 +86,8 @@ namespace LanMediaController
 
             if (IsPortInUse(HTTP_PORT))
             {
-                OpenControlWindow();
-                return;
+                KillPreviousListener(HTTP_PORT);
+                Thread.Sleep(400);
             }
 
             LoadEmbeddedResources();
@@ -135,6 +137,24 @@ namespace LanMediaController
             {
                 return true;
             }
+        }
+
+        private static void KillPreviousListener(int port)
+        {
+            try
+            {
+                int myPid = Process.GetCurrentProcess().Id;
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = "/c for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :" + port + " ^| findstr LISTENING') do @if not \"%a\"==\"" + myPid + "\" taskkill /F /PID %a",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                var p = Process.Start(psi);
+                if (p != null) p.WaitForExit(1500);
+            }
+            catch { }
         }
 
         private static void LoadEmbeddedResources()
@@ -553,10 +573,33 @@ namespace LanMediaController
                                 if (RemoteLanDevices.TryGetValue(targetId, out remoteTarget))
                                 {
                                     ApplyActionToPlayer(remoteTarget.player, action, pos);
+                                    PendingPeerCommands.Enqueue(new Dictionary<string, object>
+                                    {
+                                        { "ip", remoteTarget.ip },
+                                        { "targetDeviceId", targetId },
+                                        { "action", action },
+                                        { "position", pos }
+                                    });
                                     SendUdpCommand(remoteTarget.ip, targetId, action, pos);
+                                    ThreadPool.QueueUserWorkItem(_ => SyncWithHttpPeer(remoteTarget.ip));
                                 }
                             }
                             WriteHttpResponse(stream, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+                            return;
+                        }
+
+                        if (method == "POST" && path == "/api/lan-sync")
+                        {
+                            var data = jss.Deserialize<Dictionary<string, object>>(body);
+                            string remoteIp = ((IPEndPoint)client.Client.RemoteEndPoint).Address.ToString();
+                            if (data != null && data.ContainsKey("ip"))
+                            {
+                                string bodyIp = Convert.ToString(data["ip"]);
+                                if (!string.IsNullOrEmpty(bodyIp)) remoteIp = bodyIp;
+                            }
+                            IngestRemoteSyncPayload(data, remoteIp);
+                            string replyJson = BuildLocalSyncJson(remoteIp);
+                            WriteHttpResponse(stream, "200 OK", "application/json; charset=utf-8", replyJson);
                             return;
                         }
 
@@ -603,8 +646,186 @@ namespace LanMediaController
         }
 
         // ============================================================================
-        // UDP LAN Sync (Port 19888)
+        // UDP LAN Sync (Port 19888) + HTTP /api/lan-sync Active Subnet Discovery
         // ============================================================================
+        private static void IngestRemoteSyncPayload(Dictionary<string, object> dict, string senderIp)
+        {
+            if (dict == null) return;
+            string senderHost = dict.ContainsKey("senderHostId") ? Convert.ToString(dict["senderHostId"]) : "";
+            if (senderHost == HostDeviceId) return;
+
+            if (!string.IsNullOrEmpty(senderIp) && senderIp != "127.0.0.1" && senderIp != "::1")
+            {
+                KnownPeerIps[senderIp] = true;
+            }
+
+            if (dict.ContainsKey("rooms"))
+            {
+                var roomList = dict["rooms"] as System.Collections.ArrayList;
+                if (roomList != null)
+                {
+                    foreach (var r in roomList)
+                    {
+                        string rs = Convert.ToString(r);
+                        if (!string.IsNullOrEmpty(rs)) ActiveRooms[rs] = true;
+                    }
+                }
+            }
+
+            if (dict.ContainsKey("devices"))
+            {
+                var devList = dict["devices"] as System.Collections.ArrayList;
+                if (devList != null)
+                {
+                    foreach (var item in devList)
+                    {
+                        var d = item as Dictionary<string, object>;
+                        if (d != null)
+                        {
+                            string id = d.ContainsKey("deviceId") ? Convert.ToString(d["deviceId"]) : "";
+                            if (string.IsNullOrEmpty(id) || DevicesMap.ContainsKey(id)) continue;
+
+                            var rec = RemoteLanDevices.GetOrAdd(id, _id => new DeviceRecord { deviceId = _id });
+                            rec.deviceName = d.ContainsKey("deviceName") ? Convert.ToString(d["deviceName"]) : "Device";
+                            rec.platform = d.ContainsKey("platform") ? Convert.ToString(d["platform"]) : "windows";
+                            rec.roomCode = d.ContainsKey("roomCode") ? Convert.ToString(d["roomCode"]) : "";
+                            rec.ip = d.ContainsKey("ip") && !string.IsNullOrEmpty(Convert.ToString(d["ip"])) ? Convert.ToString(d["ip"]) : senderIp;
+                            rec.lastSeen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                            if (!string.IsNullOrEmpty(rec.roomCode)) ActiveRooms[rec.roomCode] = true;
+
+                            if (d.ContainsKey("player"))
+                            {
+                                var pDict = d["player"] as Dictionary<string, object>;
+                                if (pDict != null)
+                                {
+                                    if (rec.player == null) rec.player = new PlayerState();
+                                    if (pDict.ContainsKey("title")) rec.player.title = Convert.ToString(pDict["title"]);
+                                    if (pDict.ContainsKey("isPlaying")) rec.player.isPlaying = Convert.ToBoolean(pDict["isPlaying"]);
+                                    if (pDict.ContainsKey("position")) rec.player.position = Convert.ToDouble(pDict["position"]);
+                                    if (pDict.ContainsKey("duration")) rec.player.duration = Convert.ToDouble(pDict["duration"]);
+                                    if (pDict.ContainsKey("chapterIndex")) rec.player.chapterIndex = Convert.ToInt32(pDict["chapterIndex"]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (dict.ContainsKey("pendingCommands"))
+            {
+                var cmdList = dict["pendingCommands"] as System.Collections.ArrayList;
+                if (cmdList != null)
+                {
+                    foreach (var cItem in cmdList)
+                    {
+                        var c = cItem as Dictionary<string, object>;
+                        if (c != null)
+                        {
+                            string tid = c.ContainsKey("targetDeviceId") ? Convert.ToString(c["targetDeviceId"]) : "";
+                            string act = c.ContainsKey("action") ? Convert.ToString(c["action"]) : "toggle";
+                            double pos = c.ContainsKey("position") && c["position"] != null ? Convert.ToDouble(c["position"]) : 0;
+                            DeviceRecord localTarget;
+                            if (DevicesMap.TryGetValue(tid, out localTarget))
+                            {
+                                ApplyActionToPlayer(localTarget.player, act, pos);
+                                if (localTarget.isNativeHost) SendToWinBridge(act, pos);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private static string BuildLocalSyncJson(string targetPeerIp)
+        {
+            List<string> bcasts;
+            string primaryIp = GetPrimaryLanIp(out bcasts);
+            var cmds = new List<Dictionary<string, object>>();
+            if (!string.IsNullOrEmpty(targetPeerIp))
+            {
+                int count = PendingPeerCommands.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    Dictionary<string, object> item;
+                    if (PendingPeerCommands.TryDequeue(out item))
+                    {
+                        if (Convert.ToString(item["ip"]) == targetPeerIp) cmds.Add(item);
+                        else PendingPeerCommands.Enqueue(item);
+                    }
+                }
+            }
+            var jss = new JavaScriptSerializer();
+            return jss.Serialize(new Dictionary<string, object>
+            {
+                { "type", "lan_sync" },
+                { "senderHostId", HostDeviceId },
+                { "lanName", LocalLanName },
+                { "ip", primaryIp },
+                { "httpPort", HTTP_PORT },
+                { "rooms", ActiveRooms.Keys.ToList() },
+                { "devices", DevicesMap.Values.ToList() },
+                { "pendingCommands", cmds }
+            });
+        }
+
+        private static void SyncWithHttpPeer(string peerIp)
+        {
+            try
+            {
+                List<string> bcasts;
+                string primaryIp = GetPrimaryLanIp(out bcasts);
+                if (string.IsNullOrEmpty(peerIp) || peerIp == primaryIp || peerIp == "127.0.0.1") return;
+
+                var req = (HttpWebRequest)WebRequest.Create("http://" + peerIp + ":" + HTTP_PORT + "/api/lan-sync");
+                req.Method = "POST";
+                req.ContentType = "application/json";
+                req.Timeout = 700;
+                req.ReadWriteTimeout = 700;
+
+                byte[] payload = Encoding.UTF8.GetBytes(BuildLocalSyncJson(peerIp));
+                req.ContentLength = payload.Length;
+                using (var reqStream = req.GetRequestStream())
+                {
+                    reqStream.Write(payload, 0, payload.Length);
+                }
+
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                {
+                    string replyJson = reader.ReadToEnd();
+                    var jss = new JavaScriptSerializer();
+                    var replyDict = jss.Deserialize<Dictionary<string, object>>(replyJson);
+                    IngestRemoteSyncPayload(replyDict, peerIp);
+                }
+            }
+            catch { }
+        }
+
+        private static void ScanSubnetPeers()
+        {
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    List<string> bcasts;
+                    string primaryIp = GetPrimaryLanIp(out bcasts);
+                    string[] parts = primaryIp.Split('.');
+                    if (parts.Length != 4 || primaryIp == "127.0.0.1") return;
+                    string prefix = parts[0] + "." + parts[1] + "." + parts[2] + ".";
+                    int selfLast = int.Parse(parts[3]);
+
+                    for (int i = 1; i <= 254; i++)
+                    {
+                        if (i == selfLast) continue;
+                        string targetIp = prefix + i;
+                        ThreadPool.QueueUserWorkItem(__ => SyncWithHttpPeer(targetIp));
+                        if (i % 25 == 0) Thread.Sleep(40);
+                    }
+                }
+                catch { }
+            });
+        }
+
         private static void StartUdpServer()
         {
             ThreadPool.QueueUserWorkItem(_ =>
@@ -628,33 +849,7 @@ namespace LanMediaController
                         string type = Convert.ToString(dict["type"]);
                         if (type == "lan_sync")
                         {
-                            string senderHost = dict.ContainsKey("senderHostId") ? Convert.ToString(dict["senderHostId"]) : "";
-                            if (senderHost == HostDeviceId) continue;
-
-                            if (dict.ContainsKey("devices"))
-                            {
-                                var devList = dict["devices"] as System.Collections.ArrayList;
-                                if (devList != null)
-                                {
-                                    foreach (var item in devList)
-                                    {
-                                        var d = item as Dictionary<string, object>;
-                                        if (d != null)
-                                        {
-                                            string id = d.ContainsKey("deviceId") ? Convert.ToString(d["deviceId"]) : "";
-                                            if (string.IsNullOrEmpty(id) || DevicesMap.ContainsKey(id)) continue;
-
-                                            var rec = RemoteLanDevices.GetOrAdd(id, _id => new DeviceRecord { deviceId = _id });
-                                            rec.deviceName = d.ContainsKey("deviceName") ? Convert.ToString(d["deviceName"]) : "Device";
-                                            rec.platform = d.ContainsKey("platform") ? Convert.ToString(d["platform"]) : "windows";
-                                            rec.roomCode = d.ContainsKey("roomCode") ? Convert.ToString(d["roomCode"]) : "";
-                                            rec.ip = ep.Address.ToString();
-                                            rec.lastSeen = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                                            if (!string.IsNullOrEmpty(rec.roomCode)) ActiveRooms[rec.roomCode] = true;
-                                        }
-                                    }
-                                }
-                            }
+                            IngestRemoteSyncPayload(dict, ep.Address.ToString());
                         }
                         else if (type == "command")
                         {
@@ -679,24 +874,40 @@ namespace LanMediaController
         {
             try
             {
-                if (UdpServer == null) return;
                 List<string> bcasts;
                 string primaryIp = GetPrimaryLanIp(out bcasts);
-                var jss = new JavaScriptSerializer();
-                string json = jss.Serialize(new Dictionary<string, object>
-                {
-                    { "type", "lan_sync" },
-                    { "senderHostId", HostDeviceId },
-                    { "lanName", LocalLanName },
-                    { "ip", primaryIp },
-                    { "httpPort", HTTP_PORT },
-                    { "rooms", ActiveRooms.Keys.ToList() },
-                    { "devices", DevicesMap.Values.ToList() }
-                });
+                string json = BuildLocalSyncJson(null);
                 byte[] bytes = Encoding.UTF8.GetBytes(json);
-                foreach (var b in bcasts)
+
+                if (UdpServer != null)
                 {
-                    UdpServer.Send(bytes, bytes.Length, new IPEndPoint(IPAddress.Parse(b), UDP_PORT));
+                    foreach (var b in bcasts)
+                    {
+                        UdpServer.Send(bytes, bytes.Length, new IPEndPoint(IPAddress.Parse(b), UDP_PORT));
+                    }
+                }
+
+                // 同时通过绑定在真实 WLAN 网卡 IP 上的 socket 发送广播，防止被 Radmin VPN / VMware 抢占路由
+                if (primaryIp != "127.0.0.1")
+                {
+                    try
+                    {
+                        using (var nicUdp = new UdpClient(new IPEndPoint(IPAddress.Parse(primaryIp), 0)))
+                        {
+                            nicUdp.EnableBroadcast = true;
+                            foreach (var b in bcasts)
+                            {
+                                nicUdp.Send(bytes, bytes.Length, new IPEndPoint(IPAddress.Parse(b), UDP_PORT));
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                foreach (var peerIp in KnownPeerIps.Keys)
+                {
+                    string ipCopy = peerIp;
+                    ThreadPool.QueueUserWorkItem(_ => SyncWithHttpPeer(ipCopy));
                 }
             }
             catch { }
@@ -723,11 +934,14 @@ namespace LanMediaController
 
         private static void StartBackgroundTimers()
         {
+            ScanSubnetPeers();
             ThreadPool.QueueUserWorkItem(_ =>
             {
+                int tickCount = 0;
                 while (Running)
                 {
                     Thread.Sleep(1000);
+                    tickCount++;
                     foreach (var d in DevicesMap.Values)
                     {
                         if (d.player != null && d.player.isPlaying)
@@ -745,6 +959,7 @@ namespace LanMediaController
                     }
                     catch { }
                     BroadcastUdpState();
+                    if (tickCount % 8 == 0) ScanSubnetPeers();
                 }
             });
         }

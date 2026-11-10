@@ -22,6 +22,8 @@ HFS_TIME = 3845000000  # Seconds since 1904-01-01
 def build_macos_app_files():
     with open(os.path.join(BASE_DIR, "desktop", "server.js"), "rb") as f:
         server_js = f.read()
+    with open(os.path.join(BASE_DIR, "desktop", "server.py"), "rb") as f:
+        server_py = f.read()
     with open(os.path.join(BASE_DIR, "ui", "index.html"), "rb") as f:
         index_html = f.read()
     with open(os.path.join(ASSETS_DIR, "AppIcon.icns"), "rb") as f:
@@ -36,8 +38,8 @@ def build_macos_app_files():
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "LanMediaController",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.1",
-        "CFBundleVersion": "2",
+        "CFBundleShortVersionString": "0.1.2",
+        "CFBundleVersion": "3",
         "LSMinimumSystemVersion": "10.15",
         "NSHighResolutionCapable": True,
         "NSLocalNetworkUsageDescription": "用于在局域网内发现并同步控制四端播放器",
@@ -55,6 +57,8 @@ fi
 
 if command -v node >/dev/null 2>&1; then
   nohup node "$DIR/desktop/server.js" --open >/dev/null 2>&1 &
+elif command -v python3 >/dev/null 2>&1; then
+  nohup python3 "$DIR/desktop/server.py" --open >/dev/null 2>&1 &
 else
   open "$DIR/ui/index.html"
 fi
@@ -74,6 +78,7 @@ fi
         "LanMediaController.app/Contents/MacOS/LanMediaController": (launcher_sh, 0o100755),
         "LanMediaController.app/Contents/Resources/AppIcon.icns": (app_icns, 0o100644),
         "LanMediaController.app/Contents/Resources/desktop/server.js": (server_js, 0o100644),
+        "LanMediaController.app/Contents/Resources/desktop/server.py": (server_py, 0o100755),
         "LanMediaController.app/Contents/Resources/ui/index.html": (index_html, 0o100644),
         "README.txt": (readme_txt, 0o100644),
     }

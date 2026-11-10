@@ -570,7 +570,7 @@
     let myDeviceName = sessionStorage.getItem('lan_ctrl_device_name') || `${PLATFORM_LABELS[myPlatform]} 设备`;
     let currentRoomCode = '';
 
-    // 支持 Android APK (file://) 离线独立运行与局域网主机互联
+    // 支持 file:// 模式自动发现局域网内的主机服务 (Windows / macOS)
     const isFileProtocol = window.location.protocol === 'file:';
     let apiBaseUrl = localStorage.getItem('lan_ctrl_api_base') || '';
     let localFallbackPlayer = {
@@ -580,6 +580,55 @@
       duration: 300,
       chapterIndex: 1
     };
+
+    async function probeHostIp(ip) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 600);
+      try {
+        const res = await fetch(`http://${ip}:19889/api/state`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) {
+          apiBaseUrl = `http://${ip}:19889`;
+          localStorage.setItem('lan_ctrl_api_base', apiBaseUrl);
+          return true;
+        }
+      } catch (e) {
+        clearTimeout(timer);
+      }
+      return false;
+    }
+
+    async function autoDiscoverLanServer() {
+      if (!isFileProtocol) return;
+      if (apiBaseUrl) {
+        const ip = apiBaseUrl.replace(/^https?:\/\//, '').split(':')[0];
+        if (await probeHostIp(ip)) return;
+      }
+      // 优先探测本机与常见局域网段
+      const priorityIps = ['127.0.0.1', '10.0.0.206'];
+      for (const ip of priorityIps) {
+        if (await probeHostIp(ip)) return;
+      }
+      // 并发扫描 10.0.0.x 与 192.168.1.x / 192.168.0.x
+      const prefixes = ['10.0.0.', '192.168.1.', '192.168.0.'];
+      for (const prefix of prefixes) {
+        for (let start = 1; start <= 254; start += 25) {
+          const batch = [];
+          for (let i = start; i < start + 25 && i <= 254; i++) {
+            batch.push(probeHostIp(`${prefix}${i}`));
+          }
+          const results = await Promise.all(batch);
+          if (results.some(Boolean)) return;
+        }
+      }
+    }
+
+    if (isFileProtocol) {
+      autoDiscoverLanServer();
+      setInterval(() => {
+        if (!apiBaseUrl) autoDiscoverLanServer();
+      }, 5000);
+    }
 
     setInterval(() => {
       if (localFallbackPlayer.isPlaying) {
