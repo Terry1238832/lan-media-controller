@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>四端媒体控制器</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --text-main: #f8fafc;
+      --text-sub: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --playing: #10b981;
+      --danger: #ef4444;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+
+    input {
+      user-select: text;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background-color: var(--bg);
+      color: var(--text-main);
+      min-height: 100vh;
+      padding: calc(env(safe-area-inset-top, 0px) + 14px) 14px calc(env(safe-area-inset-bottom, 0px) + 24px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 520px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    /* 1. 页面最上方：当前局域网名称 */
+    .lan-header {
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+    }
+
+    .lan-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .wifi-dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background-color: var(--playing);
+      box-shadow: 0 0 10px var(--playing);
+      flex-shrink: 0;
+    }
+
+    .lan-label {
+      font-size: 12px;
+      color: var(--text-sub);
+      margin-bottom: 2px;
+    }
+
+    .lan-name {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    .lan-ip {
+      font-size: 12px;
+      color: var(--text-sub);
+      background: rgba(255, 255, 255, 0.06);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    /* 2. 设备信息与房间控制面板 */
+    .panel-card {
+      background-color: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .field-row {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .field-label {
+      font-size: 12px;
+      color: var(--text-sub);
+      font-weight: 600;
+    }
+
+    .device-input-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    .text-input {
+      flex: 1;
+      height: 40px;
+      background: #0f172a;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 0 12px;
+      color: var(--text-main);
+      font-size: 14px;
+      outline: none;
+    }
+
+    .text-input:focus {
+      border-color: var(--accent);
+    }
+
+    .platform-selector {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+
+    .plat-option {
+      height: 34px;
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text-sub);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s ease;
+    }
+
+    .plat-option.active {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: var(--accent);
+      color: #60a5fa;
+    }
+
+    /* 未进房：开房间 / 加入房间 */
+    .room-lobby {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-top: 4px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .lobby-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .btn {
+      height: 42px;
+      padding: 0 16px;
+      border-radius: 10px;
+      border: none;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: opacity 0.15s ease, transform 0.1s ease;
+      white-space: nowrap;
+    }
+
+    .btn:active {
+      transform: scale(0.97);
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn-success {
+      background: var(--playing);
+      color: #fff;
+    }
+
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.16);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.35);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-main);
+    }
+
+    .code-input {
+      width: 120px;
+      height: 42px;
+      background: #0f172a;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 4px;
+      color: var(--text-main);
+      outline: none;
+    }
+
+    .code-input:focus {
+      border-color: var(--accent);
+    }
+
+    .active-rooms-bar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-sub);
+    }
+
+    .room-chip {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      padding: 2px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    /* 已进房：显示4位房间码与退出房间 */
+    .room-active-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-top: 8px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .room-code-display {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .room-code-label {
+      font-size: 13px;
+      color: var(--text-sub);
+    }
+
+    .room-code-num {
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: 3px;
+      color: #60a5fa;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    /* 3. 房间内播放器卡片列表 */
+    .section-title {
+      font-size: 13px;
+      color: var(--text-sub);
+      font-weight: 600;
+      padding: 0 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .players-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .empty-room-hint {
+      text-align: center;
+      padding: 32px 16px;
+      color: var(--text-sub);
+      font-size: 14px;
+      background: rgba(30, 41, 59, 0.5);
+      border: 1px dashed var(--card-border);
+      border-radius: 16px;
+    }
+
+    .player-card {
+      background-color: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .player-card.active-playing {
+      border-color: rgba(16, 185, 129, 0.6);
+      box-shadow: 0 6px 20px rgba(16, 185, 129, 0.12);
+    }
+
+    .player-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .player-title-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      overflow: hidden;
+    }
+
+    .platform-badge {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 8px;
+      flex-shrink: 0;
+    }
+
+    .badge-windows { background: rgba(59, 130, 246, 0.18); color: #60a5fa; }
+    .badge-macos   { background: rgba(168, 85, 247, 0.18); color: #c084fc; }
+    .badge-ios     { background: rgba(236, 72, 153, 0.18); color: #f472b6; }
+    .badge-android { background: rgba(16, 185, 129, 0.18); color: #34d399; }
+
+    .device-name-text {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-main);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .self-tag {
+      font-size: 11px;
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text-sub);
+      padding: 2px 6px;
+      border-radius: 6px;
+      flex-shrink: 0;
+    }
+
+    .player-track {
+      font-size: 13px;
+      color: var(--text-sub);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex-shrink: 0;
+    }
+
+    /* 进度条区域 */
+    .progress-section {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .progress-slider {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 6px;
+      border-radius: 999px;
+      background: #334155;
+      outline: none;
+      cursor: pointer;
+    }
+
+    .progress-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--text-main);
+      border: 3px solid var(--accent);
+      cursor: pointer;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+    }
+
+    .time-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-sub);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* 控制按钮区域：上一章、播放/暂停、下一章 */
+    .controls-row {
+      display: grid;
+      grid-template-columns: 1fr 1.3fr 1fr;
+      gap: 10px;
+    }
+
+    .ctrl-btn {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--text-main);
+      height: 42px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.1s ease;
+    }
+
+    .ctrl-btn:hover {
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .ctrl-btn:active {
+      transform: scale(0.97);
+    }
+
+    .ctrl-btn.play-btn {
+      background: var(--accent);
+      border-color: transparent;
+      color: #ffffff;
+    }
+
+    .ctrl-btn.play-btn.is-playing {
+      background: var(--playing);
+    }
+
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- 1. 页面最上方：显示当前局域网名称 -->
+    <div class="lan-header">
+      <div class="lan-info">
+        <div class="wifi-dot"></div>
+        <div>
+          <div class="lan-label">当前局域网</div>
+          <div class="lan-name" id="lanNameText">正在检测...</div>
+        </div>
+      </div>
+      <div class="lan-ip" id="lanIpText">--</div>
+    </div>
+
+    <!-- 2. 本机设备名称设置 + 房间创建/加入/退出 -->
+    <div class="panel-card">
+      <div class="field-row">
+        <div class="field-label">当前设备类型与设备名称</div>
+        <div class="platform-selector" id="platformSelector">
+          <button type="button" class="plat-option" data-plat="windows">Windows</button>
+          <button type="button" class="plat-option" data-plat="macos">macOS</button>
+          <button type="button" class="plat-option" data-plat="ios">iOS</button>
+          <button type="button" class="plat-option" data-plat="android">Android</button>
+        </div>
+        <div class="device-input-group">
+          <input type="text" id="deviceNameInput" class="text-input" placeholder="输入设备名称（如：我的电脑 / 卧室iPhone）" maxlength="24" />
+          <button type="button" id="saveNameBtn" class="btn btn-secondary">保存名称</button>
+        </div>
+      </div>
+
+      <!-- 未在房间内：独立开房间 或 输入4位匹配码加入房间 -->
+      <div id="roomLobbyBox" class="room-lobby">
+        <div class="lobby-actions">
+          <button type="button" id="createRoomBtn" class="btn btn-success" style="flex:1;">+ 独立开房间 (生成4位码)</button>
+        </div>
+        <div class="lobby-actions">
+          <input type="text" id="joinCodeInput" class="code-input" placeholder="4位码" maxlength="4" inputmode="numeric" />
+          <button type="button" id="joinRoomBtn" class="btn btn-primary" style="flex:1;">加入房间</button>
+        </div>
+        <div id="activeRoomsBox" class="active-rooms-bar hidden"></div>
+      </div>
+
+      <!-- 已在房间内：显示4位数房间匹配码与退出按钮 -->
+      <div id="roomActiveBox" class="room-active-bar hidden">
+        <div class="room-code-display">
+          <span class="room-code-label">房间匹配码</span>
+          <span class="room-code-num" id="currentRoomCodeText">----</span>
+        </div>
+        <button type="button" id="leaveRoomBtn" class="btn btn-danger">退出房间</button>
+      </div>
+    </div>
+
+    <!-- 3. 房间内设备播放器列表 -->
+    <div class="section-title">
+      <span id="roomSectionLabel">房间内播放器</span>
+      <span id="roomCountLabel"></span>
+    </div>
+
+    <div id="emptyRoomHint" class="empty-room-hint">
+      请先点击上方「独立开房间」生成 4 位数匹配码，或输入 4 位数匹配码「加入房间」
+    </div>
+
+    <div class="players-list" id="playersList"></div>
+  </div>
+
+  <script>
+    const PLATFORM_LABELS = {
+      windows: 'Windows',
+      macos: 'macOS',
+      ios: 'iOS',
+      android: 'Android'
+    };
+
+    function detectDefaultPlatform() {
+      const ua = navigator.userAgent.toLowerCase();
+      if (/iphone|ipad|ipod/.test(ua)) return 'ios';
+      if (/android/.test(ua)) return 'android';
+      if (/macintosh|mac os x/.test(ua)) return 'macos';
+      return 'windows';
+    }
+
+    // 每个窗口/设备拥有独立 deviceId，方便单机多开窗口或跨设备测试房间功能
+    let myDeviceId = sessionStorage.getItem('lan_ctrl_device_id');
+    if (!myDeviceId) {
+      myDeviceId = 'dev-' + Math.random().toString(36).slice(2, 10);
+      sessionStorage.setItem('lan_ctrl_device_id', myDeviceId);
+    }
+
+    let myPlatform = sessionStorage.getItem('lan_ctrl_platform') || detectDefaultPlatform();
+    let myDeviceName = sessionStorage.getItem('lan_ctrl_device_name') || `${PLATFORM_LABELS[myPlatform]} 设备`;
+    let currentRoomCode = '';
+
+    // 支持 Android APK (file://) 离线独立运行与局域网主机互联
+    const isFileProtocol = window.location.protocol === 'file:';
+    let apiBaseUrl = localStorage.getItem('lan_ctrl_api_base') || '';
+    let localFallbackPlayer = {
+      title: '第 1 章',
+      isPlaying: false,
+      position: 0,
+      duration: 300,
+      chapterIndex: 1
+    };
+
+    setInterval(() => {
+      if (localFallbackPlayer.isPlaying) {
+        localFallbackPlayer.position = Math.min(localFallbackPlayer.duration, localFallbackPlayer.position + 1);
+        if (localFallbackPlayer.position >= localFallbackPlayer.duration) localFallbackPlayer.position = 0;
+      }
+    }, 1000);
+
+    async function apiFetch(path, options) {
+      const url = isFileProtocol ? (apiBaseUrl ? `${apiBaseUrl}${path}` : null) : path;
+      if (!url) throw new Error('local-mode');
+      return fetch(url, options);
+    }
+
+    const draggingState = new Map();
+    const deviceNameInput = document.getElementById('deviceNameInput');
+    const joinCodeInput = document.getElementById('joinCodeInput');
+
+    deviceNameInput.value = myDeviceName;
+
+    function updatePlatformButtons() {
+      document.querySelectorAll('#platformSelector .plat-option').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.plat === myPlatform);
+      });
+    }
+    updatePlatformButtons();
+
+    document.querySelectorAll('#platformSelector .plat-option').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        myPlatform = btn.dataset.plat;
+        sessionStorage.setItem('lan_ctrl_platform', myPlatform);
+        if (!deviceNameInput.value.trim() || /^(Windows|macOS|iOS|Android) 设备$/.test(deviceNameInput.value.trim())) {
+          myDeviceName = `${PLATFORM_LABELS[myPlatform]} 设备`;
+          deviceNameInput.value = myDeviceName;
+          sessionStorage.setItem('lan_ctrl_device_name', myDeviceName);
+        }
+        updatePlatformButtons();
+        await syncDeviceInfo();
+      });
+    });
+
+    async function syncDeviceInfo() {
+      const val = deviceNameInput.value.trim();
+      if (val) {
+        myDeviceName = val;
+        sessionStorage.setItem('lan_ctrl_device_name', myDeviceName);
+      }
+      try {
+        await apiFetch('/api/device/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: myDeviceId,
+            deviceName: myDeviceName,
+            platform: myPlatform
+          })
+        });
+      } catch (e) {}
+      await fetchState();
+    }
+
+    document.getElementById('saveNameBtn').addEventListener('click', syncDeviceInfo);
+    deviceNameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        deviceNameInput.blur();
+        syncDeviceInfo();
+      }
+    });
+
+    // 独立开房间 (生成 4 位匹配码)
+    document.getElementById('createRoomBtn').addEventListener('click', async () => {
+      const val = deviceNameInput.value.trim();
+      if (val) myDeviceName = val;
+      try {
+        const res = await apiFetch('/api/room/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: myDeviceId,
+            deviceName: myDeviceName,
+            platform: myPlatform
+          })
+        });
+        const data = await res.json();
+        if (data.ok && data.roomCode) {
+          currentRoomCode = data.roomCode;
+        }
+      } catch (e) {
+        currentRoomCode = String(Math.floor(1000 + Math.random() * 9000));
+      }
+      await fetchState();
+    });
+
+    // 加入房间 (输入 4 位匹配码)
+    async function joinRoomByCode(code) {
+      const clean = String(code || '').trim();
+      if (!/^\d{4}$/.test(clean)) {
+        joinCodeInput.focus();
+        return;
+      }
+      const val = deviceNameInput.value.trim();
+      if (val) myDeviceName = val;
+      try {
+        const res = await apiFetch('/api/room/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: myDeviceId,
+            deviceName: myDeviceName,
+            platform: myPlatform,
+            roomCode: clean
+          })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          currentRoomCode = data.roomCode;
+          joinCodeInput.value = '';
+        }
+      } catch (e) {
+        currentRoomCode = clean;
+        joinCodeInput.value = '';
+      }
+      await fetchState();
+    }
+
+    document.getElementById('joinRoomBtn').addEventListener('click', () => {
+      joinRoomByCode(joinCodeInput.value);
+    });
+
+    joinCodeInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') joinRoomByCode(joinCodeInput.value);
+    });
+
+    // 退出房间
+    document.getElementById('leaveRoomBtn').addEventListener('click', async () => {
+      try {
+        await apiFetch('/api/room/leave', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceId: myDeviceId })
+        });
+      } catch (e) {}
+      currentRoomCode = '';
+      await fetchState();
+    });
+
+    function formatTime(sec) {
+      const s = Math.max(0, Math.floor(Number(sec) || 0));
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+    }
+
+    async function sendCommand(targetDeviceId, action, position) {
+      try {
+        await apiFetch('/api/control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetDeviceId, action, position })
+        });
+      } catch (e) {
+        if (action === 'toggle') localFallbackPlayer.isPlaying = !localFallbackPlayer.isPlaying;
+        else if (action === 'play') localFallbackPlayer.isPlaying = true;
+        else if (action === 'pause') localFallbackPlayer.isPlaying = false;
+        else if (action === 'seek') {
+          localFallbackPlayer.position = Number(position) || 0;
+          localFallbackPlayer.isPlaying = true;
+        } else if (action === 'next') {
+          localFallbackPlayer.chapterIndex += 1;
+          localFallbackPlayer.title = `第 ${localFallbackPlayer.chapterIndex} 章`;
+          localFallbackPlayer.position = 0;
+          localFallbackPlayer.isPlaying = true;
+        } else if (action === 'prev') {
+          localFallbackPlayer.chapterIndex = Math.max(1, localFallbackPlayer.chapterIndex - 1);
+          localFallbackPlayer.title = `第 ${localFallbackPlayer.chapterIndex} 章`;
+          localFallbackPlayer.position = 0;
+          localFallbackPlayer.isPlaying = true;
+        }
+      }
+      await fetchState();
+    }
+
+    function renderRoomPlayers(devices) {
+      const container = document.getElementById('playersList');
+      const emptyHint = document.getElementById('emptyRoomHint');
+      const roomSectionLabel = document.getElementById('roomSectionLabel');
+      const roomCountLabel = document.getElementById('roomCountLabel');
+
+      if (!currentRoomCode) {
+        emptyHint.classList.remove('hidden');
+        emptyHint.textContent = '请先点击上方「独立开房间」生成 4 位数匹配码，或输入 4 位数匹配码「加入房间」';
+        container.innerHTML = '';
+        roomSectionLabel.textContent = '暂未加入房间';
+        roomCountLabel.textContent = '';
+        return;
+      }
+
+      emptyHint.classList.add('hidden');
+      roomSectionLabel.textContent = `房间 ${currentRoomCode} 内的设备播放器`;
+      roomCountLabel.textContent = `共 ${devices.length} 台设备`;
+
+      const currentKeys = Array.from(container.children).map(el => el.dataset.key).join('|');
+      const nextKeys = devices.map(d => d.deviceId).join('|');
+
+      if (currentKeys !== nextKeys) {
+        container.innerHTML = '';
+        for (const dev of devices) {
+          const el = document.createElement('div');
+          el.className = 'player-card';
+          el.dataset.key = dev.deviceId;
+          el.innerHTML = `
+            <div class="player-top">
+              <div class="player-title-group">
+                <span class="platform-badge"></span>
+                <span class="device-name-text"></span>
+                <span class="self-tag hidden">本机</span>
+              </div>
+              <span class="player-track"></span>
+            </div>
+            <div class="progress-section">
+              <input type="range" class="progress-slider" min="0" max="300" step="1" value="0" />
+              <div class="time-row">
+                <span class="pos-text">00:00</span>
+                <span class="dur-text">05:00</span>
+              </div>
+            </div>
+            <div class="controls-row">
+              <button class="ctrl-btn prev-btn" type="button">⏮ 上一章</button>
+              <button class="ctrl-btn play-btn" type="button">▶ 播放</button>
+              <button class="ctrl-btn next-btn" type="button">⏭ 下一章</button>
+            </div>
+          `;
+
+          const slider = el.querySelector('.progress-slider');
+          const posText = el.querySelector('.pos-text');
+          const prevBtn = el.querySelector('.prev-btn');
+          const playBtn = el.querySelector('.play-btn');
+          const nextBtn = el.querySelector('.next-btn');
+
+          slider.addEventListener('input', () => {
+            draggingState.set(dev.deviceId, Number(slider.value));
+            posText.textContent = formatTime(slider.value);
+          });
+
+          // 拖动进度条松手后：跳转到指定进度并直接开始播放
+          const commitSeek = () => {
+            if (!draggingState.has(dev.deviceId)) return;
+            const targetPos = Number(slider.value);
+            draggingState.delete(dev.deviceId);
+            sendCommand(dev.deviceId, 'seek', targetPos);
+          };
+          slider.addEventListener('change', commitSeek);
+          slider.addEventListener('mouseup', commitSeek);
+          slider.addEventListener('touchend', commitSeek);
+
+          prevBtn.addEventListener('click', () => sendCommand(dev.deviceId, 'prev'));
+          playBtn.addEventListener('click', () => sendCommand(dev.deviceId, 'toggle'));
+          nextBtn.addEventListener('click', () => sendCommand(dev.deviceId, 'next'));
+
+          container.appendChild(el);
+        }
+      }
+
+      Array.from(container.children).forEach((el, idx) => {
+        const dev = devices[idx];
+        if (!dev) return;
+        const p = dev.player || {};
+        const plat = dev.platform || 'windows';
+
+        el.classList.toggle('active-playing', Boolean(p.isPlaying));
+
+        const badge = el.querySelector('.platform-badge');
+        badge.className = `platform-badge badge-${plat}`;
+        badge.textContent = PLATFORM_LABELS[plat] || plat;
+
+        el.querySelector('.device-name-text').textContent = dev.deviceName || '未命名设备';
+        el.querySelector('.self-tag').classList.toggle('hidden', dev.deviceId !== myDeviceId);
+        el.querySelector('.player-track').textContent = p.title || '第 1 章';
+
+        const slider = el.querySelector('.progress-slider');
+        const posText = el.querySelector('.pos-text');
+        const durText = el.querySelector('.dur-text');
+        const playBtn = el.querySelector('.play-btn');
+
+        const dur = Math.max(1, Math.round(p.duration || 300));
+        slider.max = String(dur);
+        durText.textContent = formatTime(dur);
+
+        if (!draggingState.has(dev.deviceId)) {
+          const pos = Math.min(dur, Math.max(0, Math.round(p.position || 0)));
+          slider.value = String(pos);
+          posText.textContent = formatTime(pos);
+        }
+
+        playBtn.classList.toggle('is-playing', Boolean(p.isPlaying));
+        playBtn.textContent = p.isPlaying ? '⏸ 暂停' : '▶ 播放';
+      });
+    }
+
+    async function fetchState() {
+      let data = null;
+      try {
+        const params = new URLSearchParams({
+          deviceId: myDeviceId,
+          platform: myPlatform,
+          deviceName: myDeviceName
+        });
+        const res = await apiFetch(`/api/state?${params.toString()}`);
+        data = await res.json();
+      } catch (e) {
+        data = {
+          lanName: '当前局域网 (Wi-Fi)',
+          localIp: '本机独立模式',
+          httpPort: 19889,
+          selfDevice: {
+            deviceId: myDeviceId,
+            deviceName: myDeviceName,
+            platform: myPlatform,
+            roomCode: currentRoomCode,
+            player: localFallbackPlayer
+          },
+          roomDevices: currentRoomCode ? [{
+            deviceId: myDeviceId,
+            deviceName: myDeviceName,
+            platform: myPlatform,
+            roomCode: currentRoomCode,
+            player: localFallbackPlayer
+          }] : [],
+          activeRooms: currentRoomCode ? [currentRoomCode] : []
+        };
+      }
+
+      document.getElementById('lanNameText').textContent = data.lanName || 'Local Network';
+      document.getElementById('lanIpText').textContent = data.localIp ? (data.localIp.includes('本机') ? data.localIp : `${data.localIp}:${data.httpPort || 19889}`) : '';
+
+      if (data.selfDevice) {
+        currentRoomCode = data.selfDevice.roomCode || '';
+      }
+
+      const lobbyBox = document.getElementById('roomLobbyBox');
+      const activeBox = document.getElementById('roomActiveBox');
+      const activeRoomsBox = document.getElementById('activeRoomsBox');
+
+      if (currentRoomCode) {
+        lobbyBox.classList.add('hidden');
+        activeBox.classList.remove('hidden');
+        document.getElementById('currentRoomCodeText').textContent = currentRoomCode;
+      } else {
+        lobbyBox.classList.remove('hidden');
+        activeBox.classList.add('hidden');
+
+        const rooms = Array.isArray(data.activeRooms) ? data.activeRooms : [];
+        if (rooms.length > 0) {
+          activeRoomsBox.classList.remove('hidden');
+          activeRoomsBox.innerHTML = '<span>局域网内现有房间：</span>';
+          rooms.forEach(code => {
+            const chip = document.createElement('span');
+            chip.className = 'room-chip';
+            chip.textContent = code;
+            chip.addEventListener('click', () => joinRoomByCode(code));
+            activeRoomsBox.appendChild(chip);
+          });
+        } else {
+          activeRoomsBox.classList.add('hidden');
+        }
+      }
+
+      renderRoomPlayers(Array.isArray(data.roomDevices) ? data.roomDevices : []);
+    }
+
+    fetchState();
+    setInterval(fetchState, 1000);
+  </script>
+</body>
+</html>
