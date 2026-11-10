@@ -610,6 +610,14 @@
       chapterIndex: 1
     };
 
+    if (window.__INITIAL_MEDIA_STATE__ && typeof window.__INITIAL_MEDIA_STATE__ === 'object') {
+      const initSt = window.__INITIAL_MEDIA_STATE__;
+      if (initSt.title) selfPlayer.title = initSt.title;
+      if (typeof initSt.isPlaying === 'boolean') selfPlayer.isPlaying = initSt.isPlaying;
+      if (typeof initSt.duration === 'number' && initSt.duration > 0) selfPlayer.duration = Math.round(initSt.duration);
+      if (typeof initSt.position === 'number' && initSt.position >= 0) selfPlayer.position = Math.round(initSt.position);
+    }
+
     // 跨设备实时房间同步表: Map<deviceId, DeviceRecord>
     const roomPeersMap = new Map();
     const peerLastTsMap = new Map();
@@ -755,6 +763,23 @@
         lobbyEventSource = new EventSource(`${RELAY_BASE}/${LOBBY_TOPIC}/sse?since=2h`);
         lobbyEventSource.onmessage = (ev) => processLobbyMessage(ev.data);
       } catch (e) {}
+
+      if (window.__MAC_BRIDGE_TOPIC__) {
+        const macTopic = String(window.__MAC_BRIDGE_TOPIC__).trim();
+        const processMacBridgeLine = (rawLine) => {
+          try {
+            const outer = JSON.parse(rawLine);
+            if (!outer || outer.event !== 'message' || !outer.message) return;
+            const st = JSON.parse(outer.message);
+            if (st && window.__onNativeMediaState) window.__onNativeMediaState(st);
+          } catch (e) {}
+        };
+        pollTopicSnapshot(macTopic, processMacBridgeLine);
+        try {
+          const macEs = new EventSource(`${RELAY_BASE}/${macTopic}/sse?since=10m`);
+          macEs.onmessage = (ev) => processMacBridgeLine(ev.data);
+        } catch (e) {}
+      }
     }
 
     function broadcastMyRoomPresence(isNewJoin = false) {

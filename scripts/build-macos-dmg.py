@@ -42,8 +42,8 @@ def build_macos_app_files():
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "LanMediaController",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.5",
-        "CFBundleVersion": "6",
+        "CFBundleShortVersionString": "0.1.6",
+        "CFBundleVersion": "7",
         "LSMinimumSystemVersion": "10.15",
         "NSHighResolutionCapable": True,
         "NSAppTransportSecurity": {
@@ -56,74 +56,52 @@ def build_macos_app_files():
     mac_media_helper_sh = ("""#!/bin/bash
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 MODE="$1"
-
-if [ "$MODE" = "cmd" ]; then
-  ACTION="$2"
-  POS="${3:-0}"
-  /usr/bin/env -u __CFBundleIdentifier /usr/bin/osascript -l JavaScript -e '
-    ObjC.import("Cocoa");
-    var b = $.NSBundle.bundleWithPath($("/System/Library/PrivateFrameworks/MediaRemote.framework"));
-    if (b && !b.isNil()) b.load;
-    try {
-      ObjC.bindFunction("MRMediaRemoteSendCommand", ["bool", ["int", "id"]]);
-      ObjC.bindFunction("MRMediaRemoteSetElapsedTime", ["void", ["double"]]);
-    } catch (e) {}
-
-    var act = "'"$ACTION"'";
-    var pos = Number("'"$POS"'") || 0;
-    try {
-      if (act === "play") $.MRMediaRemoteSendCommand(0, null);
-      else if (act === "pause") $.MRMediaRemoteSendCommand(1, null);
-      else if (act === "toggle") $.MRMediaRemoteSendCommand(2, null);
-      else if (act === "next") $.MRMediaRemoteSendCommand(4, null);
-      else if (act === "prev") $.MRMediaRemoteSendCommand(5, null);
-      else if (act === "seek") {
-        $.MRMediaRemoteSetElapsedTime(pos);
-        $.MRMediaRemoteSendCommand(0, null);
-      }
-      $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.18));
-    } catch (e) {}
-  ' >/dev/null 2>&1
-  exit 0
-fi
-
-PARENT_PID="$2"
 STATE_FILE="/tmp/lmc_mac_media_state.json"
 
-while true; do
-  if [ -n "$PARENT_PID" ] && ! kill -0 "$PARENT_PID" 2>/dev/null; then
-    exit 0
+check_pmset_playing() {
+  local out
+  out=$(/usr/bin/pmset -g assertions 2>/dev/null)
+  if echo "$out" | grep -qiE "QQMusic|QQ音乐|NeteaseMusic|网易云|Spotify|Playing audio|audio-out|coreaudiod.*PreventUserIdleSystemSleep|com\\.apple\\.audio\\..*preventuseridlesleep"; then
+    echo "1"
+  else
+    echo "0"
   fi
+}
 
-  PMSET_OUT=$(/usr/bin/pmset -g assertions 2>/dev/null)
-  PMSET_PLAYING=0
-  PMSET_APP=""
-  if echo "$PMSET_OUT" | grep -qiE "QQMusic|QQ音乐"; then
-    PMSET_PLAYING=1
-    PMSET_APP="QQ音乐"
-  elif echo "$PMSET_OUT" | grep -qiE "NeteaseMusic|网易云"; then
-    PMSET_PLAYING=1
-    PMSET_APP="网易云音乐"
-  elif echo "$PMSET_OUT" | grep -qiE "Spotify"; then
-    PMSET_PLAYING=1
-    PMSET_APP="Spotify"
-  elif echo "$PMSET_OUT" | grep -qiE "Playing audio|audio-out|coreaudiod.*PreventUserIdleSystemSleep"; then
-    PMSET_PLAYING=1
+check_pmset_app() {
+  local out
+  out=$(/usr/bin/pmset -g assertions 2>/dev/null)
+  if echo "$out" | grep -qiE "QQMusic|QQ音乐"; then
+    echo "QQ音乐"
+  elif echo "$out" | grep -qiE "NeteaseMusic|网易云"; then
+    echo "网易云音乐"
+  elif echo "$out" | grep -qiE "Spotify"; then
+    echo "Spotify"
+  else
+    echo ""
   fi
+}
 
-  JSON_OUT=$(/usr/bin/env -u __CFBundleIdentifier /usr/bin/osascript -l JavaScript -e '
+detect_media_json() {
+  local pmset_play
+  local pmset_app
+  pmset_play=$(check_pmset_playing)
+  pmset_app=$(check_pmset_app)
+
+  /usr/bin/env -u __CFBundleIdentifier /usr/bin/osascript -l JavaScript -e '
     ObjC.import("Cocoa");
     ObjC.import("CoreGraphics");
     var b = $.NSBundle.bundleWithPath($("/System/Library/PrivateFrameworks/MediaRemote.framework"));
     if (b && !b.isNil()) b.load;
 
-    var pmsetPlaying = Number("'"$PMSET_PLAYING"'") === 1;
-    var pmsetApp = "'"$PMSET_APP"'";
+    var pmsetPlaying = Number("'"$pmset_play"'") === 1;
+    var pmsetApp = "'"$pmset_app"'";
 
     var appName = "";
     var title = "";
     var artist = "";
     var isPlaying = null;
+    var hasMRClient = false;
     var duration = 0;
     var position = -1;
 
@@ -140,8 +118,10 @@ while true; do
             if (client && !client.isNil()) {
               if (client.respondsToSelector("displayName") && client.displayName && !client.displayName.isNil()) {
                 appName = ObjC.unwrap(client.displayName);
+                hasMRClient = true;
               } else if (client.respondsToSelector("bundleIdentifier") && client.bundleIdentifier && !client.bundleIdentifier.isNil()) {
                 appName = ObjC.unwrap(client.bundleIdentifier);
+                hasMRClient = true;
               }
             }
           }
@@ -151,6 +131,7 @@ while true; do
           if (item && !item.isNil() && item.respondsToSelector("metadata")) {
             var meta = item.metadata;
             if (meta && !meta.isNil()) {
+              hasMRClient = true;
               if (meta.respondsToSelector("title") && meta.title && !meta.title.isNil()) {
                 title = ObjC.unwrap(meta.title);
               }
@@ -203,7 +184,8 @@ while true; do
 
     if (!title && appName) {
       try {
-        var winList = $.CGWindowListCopyWindowInfo(0, 0);
+        var cfWins = $.CGWindowListCopyWindowInfo(0, 0);
+        var winList = ObjC.castRefToObject(cfWins);
         if (winList && !winList.isNil()) {
           var wcnt = winList.count;
           for (var j = 0; j < wcnt; j++) {
@@ -223,14 +205,14 @@ while true; do
       } catch (e) {}
     }
 
-    var finalPlaying = (isPlaying !== null) ? (isPlaying || pmsetPlaying) : pmsetPlaying;
+    var finalPlaying = (hasMRClient && isPlaying !== null) ? isPlaying : Boolean(isPlaying || pmsetPlaying);
     var displayTitle = title;
     if (artist) displayTitle = displayTitle ? (displayTitle + " - " + artist) : artist;
     if (appName) {
       if (displayTitle && displayTitle.indexOf(appName) < 0) {
         displayTitle = appName + " · " + displayTitle;
       } else if (!displayTitle) {
-        displayTitle = appName + (finalPlaying ? " · 正在播放" : " · 已就绪");
+        displayTitle = appName + (finalPlaying ? " · 正在播放" : " · 已暂停");
       }
     }
 
@@ -242,10 +224,121 @@ while true; do
       duration: duration > 0 ? duration : 300,
       ts: Date.now()
     });
-  ' 2>/dev/null)
+  ' 2>/dev/null
+}
 
+if [ "$MODE" = "once" ]; then
+  detect_media_json
+  exit 0
+fi
+
+if [ "$MODE" = "cmd" ]; then
+  ACTION="$2"
+  POS="${3:-0}"
+  BRIDGE_TOPIC="$4"
+
+  /usr/bin/env -u __CFBundleIdentifier /usr/bin/osascript -l JavaScript -e '
+    ObjC.import("Cocoa");
+    ObjC.import("CoreGraphics");
+    var b = $.NSBundle.bundleWithPath($("/System/Library/PrivateFrameworks/MediaRemote.framework"));
+    if (b && !b.isNil()) b.load;
+    try {
+      ObjC.bindFunction("MRMediaRemoteSendCommand", ["bool", ["int", "id"]]);
+      ObjC.bindFunction("MRMediaRemoteSetElapsedTime", ["void", ["double"]]);
+    } catch (e) {}
+
+    var act = "'"$ACTION"'";
+    var pos = Number("'"$POS"'") || 0;
+    var reqCls = $.NSClassFromString($("MRNowPlayingRequest"));
+    var beforeMR = null;
+    try {
+      if (reqCls && !reqCls.isNil() && reqCls.respondsToSelector("localIsPlaying")) {
+        beforeMR = Boolean(reqCls.localIsPlaying);
+      }
+    } catch (e) {}
+
+    function sendMediaKey(keyCode) {
+      try {
+        var d = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
+          14, $.NSMakePoint(0, 0), 0xa00, 0, 0, null, 8, (keyCode << 16) | (0xa << 8), -1
+        );
+        if (d && !d.isNil()) $.CGEventPost(0, d.CGEvent);
+        var u = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
+          14, $.NSMakePoint(0, 0), 0xb00, 0, 0, null, 8, (keyCode << 16) | (0xb << 8), -1
+        );
+        if (u && !u.isNil()) $.CGEventPost(0, u.CGEvent);
+      } catch (e) {}
+    }
+
+    if (act === "play" || act === "pause" || act === "toggle") {
+      sendMediaKey(16);
+      $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.18));
+      var afterMR = null;
+      try {
+        if (reqCls && !reqCls.isNil() && reqCls.respondsToSelector("localIsPlaying")) {
+          afterMR = Boolean(reqCls.localIsPlaying);
+        }
+      } catch (e) {}
+      if (beforeMR === afterMR) {
+        try {
+          if (act === "play") $.MRMediaRemoteSendCommand(0, null);
+          else if (act === "pause") $.MRMediaRemoteSendCommand(1, null);
+          else $.MRMediaRemoteSendCommand(2, null);
+          $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.15));
+        } catch (e) {}
+      }
+    } else if (act === "next") {
+      sendMediaKey(17);
+      try {
+        $.MRMediaRemoteSendCommand(4, null);
+        $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.15));
+      } catch (e) {}
+    } else if (act === "prev") {
+      sendMediaKey(18);
+      try {
+        $.MRMediaRemoteSendCommand(5, null);
+        $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.15));
+      } catch (e) {}
+    } else if (act === "seek") {
+      try {
+        $.MRMediaRemoteSetElapsedTime(pos);
+        $.MRMediaRemoteSendCommand(0, null);
+        $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.15));
+      } catch (e) {}
+    }
+  ' >/dev/null 2>&1
+
+  JSON_NOW=$(detect_media_json)
+  if [ -n "$JSON_NOW" ]; then
+    echo "$JSON_NOW" > "${STATE_FILE}.tmp" && mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
+    if [ -n "$BRIDGE_TOPIC" ]; then
+      /usr/bin/curl -s -m 3 -d "$JSON_NOW" "https://ntfy.sh/$BRIDGE_TOPIC" >/dev/null 2>&1 &
+    fi
+  fi
+  exit 0
+fi
+
+PARENT_PID="$2"
+BRIDGE_TOPIC="$3"
+LAST_SIG=""
+TICK=0
+
+while true; do
+  if [ -n "$PARENT_PID" ] && ! kill -0 "$PARENT_PID" 2>/dev/null; then
+    exit 0
+  fi
+
+  JSON_OUT=$(detect_media_json)
   if [ -n "$JSON_OUT" ]; then
     echo "$JSON_OUT" > "${STATE_FILE}.tmp" && mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
+    SIG=$(echo "$JSON_OUT" | sed 's/"ts":[0-9]*//;s/"position":[-0-9]*//')
+    TICK=$((TICK + 1))
+    if [ "$SIG" != "$LAST_SIG" ] || [ $((TICK % 4)) -eq 0 ]; then
+      LAST_SIG="$SIG"
+      if [ -n "$BRIDGE_TOPIC" ]; then
+        /usr/bin/curl -s -m 3 -d "$JSON_OUT" "https://ntfy.sh/$BRIDGE_TOPIC" >/dev/null 2>&1 &
+      fi
+    fi
   fi
 
   sleep 1
@@ -253,66 +346,24 @@ done
 """).encode("utf-8")
 
     mac_app_jxa = ("""ObjC.import('Cocoa');
-ObjC.import('CoreGraphics');
-ObjC.import('Quartz');
 ObjC.import('WebKit');
 ObjC.import('stdlib');
-
-var mrBundle = $.NSBundle.bundleWithPath($('/System/Library/PrivateFrameworks/MediaRemote.framework'));
-if (mrBundle && !mrBundle.isNil()) mrBundle.load;
-try {
-  ObjC.bindFunction('MRMediaRemoteSendCommand', ['bool', ['int', 'id']]);
-  ObjC.bindFunction('MRMediaRemoteSetElapsedTime', ['void', ['double']]);
-} catch (e) {}
 
 var G = {
   win: null,
   webView: null,
   resDir: '',
-  lastCmd: '',
-  nativeIsPlaying: false
+  bridgeTopic: '',
+  lastCmd: ''
 };
-
-function sendMacMediaKey(keyCode) {
-  try {
-    var d = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
-      14, $.NSMakePoint(0, 0), 0xa00, 0, 0, null, 8, (keyCode << 16) | (0xa << 8), -1
-    );
-    $.CGEventPost(0, d.CGEvent);
-    var u = $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
-      14, $.NSMakePoint(0, 0), 0xb00, 0, 0, null, 8, (keyCode << 16) | (0xb << 8), -1
-    );
-    $.CGEventPost(0, u.CGEvent);
-  } catch (e) {}
-}
 
 function triggerMacMedia(action, pos) {
   var p = Math.max(0, Math.round(Number(pos) || 0));
-  var targetAct = String(action || 'toggle');
-  if (targetAct === 'play' || targetAct === 'pause' || targetAct === 'toggle') {
-    targetAct = G.nativeIsPlaying ? 'pause' : 'play';
-    G.nativeIsPlaying = !G.nativeIsPlaying;
-    sendMacMediaKey(16);
-  } else if (targetAct === 'next') {
-    G.nativeIsPlaying = true;
-    sendMacMediaKey(17);
-  } else if (targetAct === 'prev') {
-    G.nativeIsPlaying = true;
-    sendMacMediaKey(18);
-  } else if (targetAct === 'seek') {
-    G.nativeIsPlaying = true;
-    try { $.MRMediaRemoteSetElapsedTime(p); } catch (e) {}
-  }
-
-  try {
-    if (targetAct === 'play') $.MRMediaRemoteSendCommand(0, null);
-    else if (targetAct === 'pause') $.MRMediaRemoteSendCommand(1, null);
-  } catch (e) {}
-
+  var act = String(action || 'toggle');
   try {
     var task = $.NSTask.alloc.init;
     task.setLaunchPath($('/bin/bash'));
-    task.setArguments($([G.resDir + '/desktop/mac_media_helper.sh', 'cmd', targetAct, String(p)]));
+    task.setArguments($([G.resDir + '/desktop/mac_media_helper.sh', 'cmd', act, String(p), G.bridgeTopic]));
     task.launch;
   } catch (e) {}
 }
@@ -327,9 +378,14 @@ ObjC.registerSubclass({
         var env = $.NSProcessInfo.processInfo.environment;
         var resDirObj = env.objectForKey('LMC_RES_DIR');
         var ssidObj = env.objectForKey('LMC_WIFI_SSID');
+        var topicObj = env.objectForKey('LMC_BRIDGE_TOPIC');
+        var initMediaObj = env.objectForKey('LMC_INIT_MEDIA');
         var resDir = (resDirObj && !resDirObj.isNil()) ? ObjC.unwrap(resDirObj) : '';
         var ssid = (ssidObj && !ssidObj.isNil()) ? ObjC.unwrap(ssidObj) : '';
+        var bridgeTopic = (topicObj && !topicObj.isNil()) ? ObjC.unwrap(topicObj) : '';
+        var initMedia = (initMediaObj && !initMediaObj.isNil()) ? ObjC.unwrap(initMediaObj) : 'null';
         G.resDir = resDir;
+        G.bridgeTopic = bridgeTopic;
 
         var app = $.NSApplication.sharedApplication;
         app.setActivationPolicy($.NSApplicationActivationPolicyRegular);
@@ -376,13 +432,24 @@ ObjC.registerSubclass({
         var nsHtml = $.NSString.stringWithContentsOfFileEncodingError($(htmlPath), $.NSUTF8StringEncoding, null);
         if (nsHtml && !nsHtml.isNil()) {
           var htmlStr = ObjC.unwrap(nsHtml);
-          var inject = '<script>window.__INITIAL_PLATFORM__="macos";window.__INITIAL_LAN_NAME__=' + JSON.stringify(ssid || '') + ';</script></head>';
+          var safeInitMedia = 'null';
+          try {
+            if (initMedia && initMedia.trim().indexOf('{') === 0) {
+              JSON.parse(initMedia.trim());
+              safeInitMedia = initMedia.trim();
+            }
+          } catch (e) {}
+          var inject = '<script>' +
+            'window.__INITIAL_PLATFORM__="macos";' +
+            'window.__INITIAL_LAN_NAME__=' + JSON.stringify(ssid || '') + ';' +
+            'window.__MAC_BRIDGE_TOPIC__=' + JSON.stringify(bridgeTopic || '') + ';' +
+            'window.__INITIAL_MEDIA_STATE__=' + safeInitMedia + ';' +
+            '</script></head>';
           htmlStr = htmlStr.replace('</head>', inject);
           wv.loadHTMLStringBaseURL($(htmlStr), $.NSURL.URLWithString($('https://ntfy.sh/')));
         }
 
         $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(0.08, this, 'pollTitle:', null, true);
-        $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(0.6, this, 'pollMediaState:', null, true);
 
         win.makeKeyAndOrderFront(null);
         app.activateIgnoringOtherApps(true);
@@ -404,26 +471,6 @@ ObjC.registerSubclass({
             } catch (e) {}
           }
         }
-      }
-    },
-    'pollMediaState:': {
-      types: ['void', ['id']],
-      implementation: function(timer) {
-        if (!G.webView) return;
-        try {
-          var nsState = $.NSString.stringWithContentsOfFileEncodingError($('/tmp/lmc_mac_media_state.json'), $.NSUTF8StringEncoding, null);
-          if (nsState && !nsState.isNil()) {
-            var jsonStr = ObjC.unwrap(nsState).trim();
-            if (jsonStr) {
-              try {
-                var parsed = JSON.parse(jsonStr);
-                if (typeof parsed.isPlaying === 'boolean') G.nativeIsPlaying = parsed.isPlaying;
-              } catch (e) {}
-              var js = 'if (window.__onNativeMediaState) { window.__onNativeMediaState(' + jsonStr + '); }';
-              G.webView.evaluateJavaScriptCompletionHandler($(js), null);
-            }
-          }
-        } catch (e) {}
       }
     },
     'windowWillClose:': {
@@ -461,11 +508,19 @@ if [ -z "$SSID" ] || [ "$SSID" = "<redacted>" ]; then
   SSID="Rogers4808"
 fi
 
+BRIDGE_TOPIC="lmc_mac_bridge_$$_$(date +%s)"
+INIT_MEDIA=$(/bin/bash "$DIR/desktop/mac_media_helper.sh" once 2>/dev/null | tr -d '\\r\\n')
+if [ -z "$INIT_MEDIA" ]; then
+  INIT_MEDIA="null"
+fi
+
 export LMC_RES_DIR="$DIR"
 export LMC_WIFI_SSID="$SSID"
+export LMC_BRIDGE_TOPIC="$BRIDGE_TOPIC"
+export LMC_INIT_MEDIA="$INIT_MEDIA"
 
 pkill -f "mac_media_helper.sh" 2>/dev/null
-nohup /bin/bash "$DIR/desktop/mac_media_helper.sh" daemon $$ >/dev/null 2>&1 &
+nohup /bin/bash "$DIR/desktop/mac_media_helper.sh" daemon $$ "$BRIDGE_TOPIC" >/dev/null 2>&1 &
 
 OLD_PID=$(lsof -ti tcp:19889 2>/dev/null)
 if [ -n "$OLD_PID" ]; then
