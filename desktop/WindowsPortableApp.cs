@@ -51,7 +51,7 @@ namespace LanMediaController
         private static readonly ConcurrentDictionary<string, bool> KnownPeerIps = new ConcurrentDictionary<string, bool>();
         private static readonly ConcurrentQueue<Dictionary<string, object>> PendingPeerCommands = new ConcurrentQueue<Dictionary<string, object>>();
 
-        private static string LocalLanName = "\u672c\u5730\u5c40\u57df\u7f51";
+        private static string LocalLanName = "Rogers4808";
         private static string EmbeddedHtml = "";
         private static Process WinBridgeProc = null;
         private static UdpClient UdpServer = null;
@@ -78,11 +78,42 @@ namespace LanMediaController
             catch { }
         }
 
+        private static void DetectNetworkProfileFromRegistry()
+        {
+            try
+            {
+                using (var profilesKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles"))
+                {
+                    if (profilesKey != null)
+                    {
+                        foreach (var subName in profilesKey.GetSubKeyNames())
+                        {
+                            using (var sub = profilesKey.OpenSubKey(subName))
+                            {
+                                if (sub != null)
+                                {
+                                    string pName = Convert.ToString(sub.GetValue("ProfileName"));
+                                    if (!string.IsNullOrWhiteSpace(pName) && !pName.StartsWith("Network") && !pName.StartsWith("\u7f51\u7edc"))
+                                    {
+                                        LocalLanName = pName.Trim();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
         [STAThread]
         static void Main()
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            DetectNetworkProfileFromRegistry();
 
             if (IsPortInUse(HTTP_PORT))
             {

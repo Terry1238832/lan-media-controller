@@ -194,13 +194,18 @@ SSID=""
 for DEV in en0 en1; do
   if [ -z "$SSID" ]; then
     SSID=$(ipconfig getsummary "$DEV" 2>/dev/null | awk -F ' : ' '/^  SSID : / {print $2}' | tr -d '\\r\\n')
+    if [ "$SSID" = "<redacted>" ]; then SSID=""; fi
   fi
   if [ -z "$SSID" ]; then
     SSID=$(networksetup -getairportnetwork "$DEV" 2>/dev/null | sed -n 's/^Current Wi-Fi Network: //p' | tr -d '\\r\\n')
+    if [ "$SSID" = "<redacted>" ] || [ "$SSID" = "You are not associated with an AirPort network." ]; then SSID=""; fi
+  fi
+  if [ -z "$SSID" ]; then
+    SSID=$(networksetup -listpreferredwirelessnetworks "$DEV" 2>/dev/null | sed -n '2p' | sed 's/^[[:space:]]*//' | tr -d '\\r\\n')
   fi
 done
-if [ "$SSID" = "<redacted>" ] || [ "$SSID" = "You are not associated with an AirPort network." ]; then
-  SSID=""
+if [ -z "$SSID" ] || [ "$SSID" = "<redacted>" ]; then
+  SSID="Rogers4808"
 fi
 
 export LMC_RES_DIR="$DIR"

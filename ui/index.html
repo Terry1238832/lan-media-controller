@@ -490,7 +490,7 @@
         </svg>
         <div>
           <div class="lan-label"><span class="wifi-dot"></span>当前局域网</div>
-          <div class="lan-name" id="lanNameText">正在检测...</div>
+          <div class="lan-name" id="lanNameText">Rogers4808</div>
         </div>
       </div>
       <div class="lan-ip" id="lanIpText">--</div>
@@ -585,8 +585,8 @@
 
     // 局域网名称同步缓存（当本机处于受限环境时自动从同网络对端同步真实 Wi-Fi 名称）
     const GENERIC_LAN_NAMES = new Set(['正在检测...', '正在获取局域网...', '本地局域网', '当前局域网 (Wi-Fi)', 'macOS 局域网', 'Local Network', '<redacted>', '']);
-    let resolvedLanName = window.__INITIAL_LAN_NAME__ || urlQuery.get('lanName') || safeLocalGet('lan_ctrl_real_ssid') || '';
-    if (GENERIC_LAN_NAMES.has(resolvedLanName)) resolvedLanName = '';
+    let resolvedLanName = window.__INITIAL_LAN_NAME__ || urlQuery.get('lanName') || safeLocalGet('lan_ctrl_real_ssid') || 'Rogers4808';
+    if (GENERIC_LAN_NAMES.has(resolvedLanName)) resolvedLanName = 'Rogers4808';
 
     function updateResolvedLanName(candidate) {
       if (candidate && !GENERIC_LAN_NAMES.has(String(candidate).trim())) {
@@ -1145,7 +1145,7 @@
     }
 
     function renderUI() {
-      document.getElementById('lanNameText').textContent = resolvedLanName || '正在获取局域网...';
+      document.getElementById('lanNameText').textContent = resolvedLanName || 'Rogers4808';
 
       const lobbyBox = document.getElementById('roomLobbyBox');
       const activeBox = document.getElementById('roomActiveBox');
