@@ -42,8 +42,8 @@ def build_macos_app_files():
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "LanMediaController",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.7",
-        "CFBundleVersion": "8",
+        "CFBundleShortVersionString": "0.1.9",
+        "CFBundleVersion": "9",
         "LSMinimumSystemVersion": "10.15",
         "NSHighResolutionCapable": True,
         "NSAppTransportSecurity": {
@@ -145,8 +145,9 @@ detect_media_json() {
               if (isPlaying === true) {
                 if (meta.respondsToSelector("calculatedPlaybackPosition")) {
                   var cp = Number(meta.calculatedPlaybackPosition);
-                  if (cp >= 0) position = Math.round(cp);
-                } else if (meta.respondsToSelector("elapsedTime")) {
+                  if (cp >= 0 && (duration <= 0 || cp <= duration + 2)) position = Math.round(cp);
+                }
+                if (position < 0 && meta.respondsToSelector("elapsedTime")) {
                   var ep = Number(meta.elapsedTime);
                   if (ep >= 0) position = Math.round(ep);
                 }
@@ -156,7 +157,7 @@ detect_media_json() {
                   if (ep2 >= 0) position = Math.round(ep2);
                 } else if (meta.respondsToSelector("calculatedPlaybackPosition")) {
                   var cp2 = Number(meta.calculatedPlaybackPosition);
-                  if (cp2 >= 0) position = Math.round(cp2);
+                  if (cp2 >= 0 && (duration <= 0 || cp2 <= duration + 2)) position = Math.round(cp2);
                 }
               }
               if (duration > 0 && position > duration) {
@@ -167,6 +168,98 @@ detect_media_json() {
         }
       }
     } catch (e) {}
+
+    if (!title) {
+      try {
+        var origCls = $.NSClassFromString($("MROrigin"));
+        var clientCls = $.NSClassFromString($("MRClient"));
+        var playerCls = $.NSClassFromString($("MRPlayer"));
+        var pathCls = $.NSClassFromString($("MRPlayerPath"));
+        var destCls = $.NSClassFromString($("MRDestination"));
+        var cfgCls = $.NSClassFromString($("MRNowPlayingControllerConfiguration"));
+        var ctrlCls = $.NSClassFromString($("MRNowPlayingController"));
+        var pqReqCls = $.NSClassFromString($("MRPlaybackQueueRequest"));
+        if (origCls && clientCls && playerCls && pathCls && destCls && cfgCls && ctrlCls) {
+          var ctrls = [];
+          function addDest(dest, label) {
+            if (!dest || dest.isNil()) return;
+            var cfg = cfgCls.alloc.initWithDestination(dest);
+            cfg.setRequestPlaybackState(true);
+            cfg.setRequestPlaybackQueue(true);
+            cfg.setRequestClientProperties(true);
+            if (pqReqCls && !pqReqCls.isNil()) {
+              var pqr = pqReqCls.defaultPlaybackQueueRequest;
+              if (pqr && !pqr.isNil()) {
+                pqr.setIncludeMetadata(true);
+                cfg.setPlaybackQueueRequest(pqr);
+              }
+            }
+            cfg.setSingleShot(true);
+            var c = ctrlCls.alloc.initWithConfiguration(cfg);
+            c.beginLoadingUpdates;
+            ctrls.push({ label: label, ctrl: c });
+          }
+          addDest(destCls.proactiveDestination, "");
+          addDest(destCls.localDestination, "");
+          var candBids = [
+            { bid: "com.tencent.QQMusicMac", name: "QQ音乐" },
+            { bid: "com.netease.163music", name: "网易云音乐" },
+            { bid: "com.apple.Music", name: "Apple Music" },
+            { bid: "com.spotify.client", name: "Spotify" },
+            { bid: "com.colliderli.iina", name: "IINA" },
+            { bid: "com.bilibili.bilibili", name: "哔哩哔哩" }
+          ];
+          for (var bi = 0; bi < candBids.length; bi++) {
+            var cl = clientCls.alloc.initWithBundleIdentifier($(candBids[bi].bid));
+            var pp = pathCls.alloc.initWithOriginClientPlayer(origCls.localOrigin, cl, playerCls.defaultPlayer);
+            addDest(destCls.alloc.initWithPlayerPath(pp), candBids[bi].name);
+          }
+          for (var w = 0; w < 8; w++) {
+            $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.03));
+          }
+          var fallbackHit = null;
+          for (var ci = 0; ci < ctrls.length; ci++) {
+            var resp = ctrls[ci].ctrl.response;
+            if (!resp || resp.isNil()) continue;
+            var rItem = resp._mostRelevantItem;
+            if (!rItem || rItem.isNil() || !rItem.respondsToSelector("metadata")) continue;
+            var rMeta = rItem.metadata;
+            if (!rMeta || rMeta.isNil()) continue;
+            var rTitle = (rMeta.title && !rMeta.title.isNil()) ? ObjC.unwrap(rMeta.title) : "";
+            if (!rTitle) continue;
+            var rArtist = (rMeta.trackArtistName && !rMeta.trackArtistName.isNil()) ? ObjC.unwrap(rMeta.trackArtistName) : "";
+            var rDur = Number(rMeta.duration) > 0 ? Math.round(Number(rMeta.duration)) : 0;
+            var rState = Number(resp.playbackState);
+            var rPlaying = (rState === 1);
+            var rEl = Number(rMeta.elapsedTime) >= 0 ? Math.round(Number(rMeta.elapsedTime)) : 0;
+            var rCp = Number(rMeta.calculatedPlaybackPosition);
+            var rPos = (rPlaying && rCp >= 0 && (rDur <= 0 || rCp <= rDur + 2)) ? Math.round(rCp) : rEl;
+            var rApp = ctrls[ci].label;
+            if (!rApp && resp.playerPath && !resp.playerPath.isNil() && resp.playerPath.client && !resp.playerPath.client.isNil()) {
+              var rc = resp.playerPath.client;
+              if (rc.displayName && !rc.displayName.isNil()) rApp = ObjC.unwrap(rc.displayName);
+              else if (rc.bundleIdentifier && !rc.bundleIdentifier.isNil()) rApp = ObjC.unwrap(rc.bundleIdentifier);
+            }
+            var hit = { appName: rApp, title: rTitle, artist: rArtist, duration: rDur, position: rPos, isPlaying: rPlaying };
+            if (rPlaying) {
+              fallbackHit = hit;
+              break;
+            } else if (!fallbackHit) {
+              fallbackHit = hit;
+            }
+          }
+          if (fallbackHit) {
+            if (fallbackHit.appName) appName = fallbackHit.appName;
+            title = fallbackHit.title;
+            artist = fallbackHit.artist;
+            if (fallbackHit.duration > 0) duration = fallbackHit.duration;
+            position = fallbackHit.position;
+            isPlaying = fallbackHit.isPlaying;
+            hasMRClient = true;
+          }
+        }
+      } catch (e) {}
+    }
 
     if (appName.indexOf("QQMusic") >= 0 || appName.indexOf("qqmusic") >= 0) appName = "QQ音乐";
     else if (appName.indexOf("163music") >= 0 || appName.indexOf("Netease") >= 0) appName = "网易云音乐";
@@ -500,6 +593,20 @@ runner.performSelectorOnMainThreadWithObjectWaitUntilDone('startApp:', null, tru
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 export PATH="/usr/local/bin:/opt/homebrew/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:/Library/Frameworks/Python.framework/Versions/3.14/bin:/Library/Frameworks/Python.framework/Versions/3.13/bin:/Library/Frameworks/Python.framework/Versions/3.12/bin:/Library/Frameworks/Python.framework/Versions/3.11/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
+pkill -f "mac_media_helper.sh" 2>/dev/null
+nohup /bin/bash "$DIR/desktop/mac_media_helper.sh" daemon $$ >/dev/null 2>&1 &
+
+OLD_PID=$(lsof -ti tcp:19889 2>/dev/null)
+if [ -n "$OLD_PID" ]; then
+  kill -9 $OLD_PID 2>/dev/null
+fi
+
+if command -v node >/dev/null 2>&1; then
+  nohup node "$DIR/desktop/server.js" >/dev/null 2>&1 &
+elif command -v python3 >/dev/null 2>&1; then
+  nohup python3 "$DIR/desktop/server.py" >/dev/null 2>&1 &
+fi
+
 SSID=""
 for DEV in en0 en1; do
   if [ -z "$SSID" ]; then
@@ -518,7 +625,13 @@ if [ -z "$SSID" ] || [ "$SSID" = "<redacted>" ]; then
   SSID="Rogers4808"
 fi
 
-INIT_MEDIA=$(/bin/bash "$DIR/desktop/mac_media_helper.sh" once 2>/dev/null | tr -d '\\r\\n')
+INIT_MEDIA=""
+if [ -f "/tmp/lmc_mac_media_state.json" ]; then
+  INIT_MEDIA=$(cat "/tmp/lmc_mac_media_state.json" 2>/dev/null | tr -d '\\r\\n')
+fi
+if [ -z "$INIT_MEDIA" ]; then
+  INIT_MEDIA=$(/bin/bash "$DIR/desktop/mac_media_helper.sh" once 2>/dev/null | tr -d '\\r\\n')
+fi
 if [ -z "$INIT_MEDIA" ]; then
   INIT_MEDIA="null"
 fi
@@ -526,20 +639,6 @@ fi
 export LMC_RES_DIR="$DIR"
 export LMC_WIFI_SSID="$SSID"
 export LMC_INIT_MEDIA="$INIT_MEDIA"
-
-pkill -f "mac_media_helper.sh" 2>/dev/null
-nohup /bin/bash "$DIR/desktop/mac_media_helper.sh" daemon $$ >/dev/null 2>&1 &
-
-OLD_PID=$(lsof -ti tcp:19889 2>/dev/null)
-if [ -n "$OLD_PID" ]; then
-  kill -9 $OLD_PID 2>/dev/null
-fi
-
-if command -v node >/dev/null 2>&1; then
-  nohup node "$DIR/desktop/server.js" >/dev/null 2>&1 &
-elif command -v python3 >/dev/null 2>&1; then
-  nohup python3 "$DIR/desktop/server.py" >/dev/null 2>&1 &
-fi
 
 for _ in 1 2 3 4 5; do
   if lsof -ti tcp:19889 >/dev/null 2>&1; then
