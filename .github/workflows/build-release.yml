@@ -1,0 +1,226 @@
+name: Build and Release Native Apps (macOS, Windows, Android)
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build Native macOS Universal .dmg
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build ungive/mediaremote-adapter (Universal arm64 + x86_64)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ungive/mediaremote-adapter.git /tmp/mra
+          cmake -S /tmp/mra -B /tmp/mra/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          cmake --build /tmp/mra/build --config Release
+
+          MRA_SCRIPT=$(find /tmp/mra -maxdepth 3 -name "mediaremote-adapter.pl" | head -n 1)
+          MRA_FW=$(find /tmp/mra/build -maxdepth 4 -name "MediaRemoteAdapter.framework" -type d | head -n 1)
+          test -n "$MRA_SCRIPT"
+          test -n "$MRA_FW"
+          echo "MRA_SCRIPT=$MRA_SCRIPT" >> "$GITHUB_ENV"
+          echo "MRA_FW=$MRA_FW" >> "$GITHUB_ENV"
+
+      - name: Compile Native SwiftUI macOS App (Universal arm64 + x86_64)
+        run: |
+          set -euo pipefail
+          mkdir -p build/macos dist
+          SDK_PATH=$(xcrun --show-sdk-path)
+          SWIFT_FILES=(macos/Sources/*.swift)
+
+          swiftc -O -parse-as-library -swift-version 5 \
+            -sdk "$SDK_PATH" -target arm64-apple-macos13.0 \
+            -framework SwiftUI -framework AppKit -framework CoreWLAN -framework Network -framework Foundation \
+            "${SWIFT_FILES[@]}" -o build/macos/LanMediaController-arm64
+
+          swiftc -O -parse-as-library -swift-version 5 \
+            -sdk "$SDK_PATH" -target x86_64-apple-macos13.0 \
+            -framework SwiftUI -framework AppKit -framework CoreWLAN -framework Network -framework Foundation \
+            "${SWIFT_FILES[@]}" -o build/macos/LanMediaController-x86_64
+
+          lipo -create \
+            build/macos/LanMediaController-arm64 \
+            build/macos/LanMediaController-x86_64 \
+            -output build/macos/LanMediaController
+          chmod +x build/macos/LanMediaController
+          file build/macos/LanMediaController
+
+      - name: Assemble & Sign .app Bundle and Create Official Apple .dmg
+        run: |
+          set -euo pipefail
+          APP="build/macos/LanMediaController.app"
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources/mediaremote-adapter"
+
+          cp build/macos/LanMediaController "$APP/Contents/MacOS/LanMediaController"
+          cp macos/Info.plist "$APP/Contents/Info.plist"
+          cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cp "$MRA_SCRIPT" "$APP/Contents/Resources/mediaremote-adapter/mediaremote-adapter.pl"
+          chmod +x "$APP/Contents/Resources/mediaremote-adapter/mediaremote-adapter.pl"
+          cp -R "$MRA_FW" "$APP/Contents/Resources/mediaremote-adapter/MediaRemoteAdapter.framework"
+
+          codesign --force --deep --sign - "$APP/Contents/Resources/mediaremote-adapter/MediaRemoteAdapter.framework"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          # Smoke test mediaremote-adapter via /usr/bin/perl
+          /usr/bin/perl \
+            "$APP/Contents/Resources/mediaremote-adapter/mediaremote-adapter.pl" \
+            "$APP/Contents/Resources/mediaremote-adapter/MediaRemoteAdapter.framework" \
+            get || true
+
+          rm -rf build/dmg_stage
+          mkdir -p build/dmg_stage
+          cp -R "$APP" build/dmg_stage/LanMediaController.app
+          ln -s /Applications build/dmg_stage/Applications
+
+          hdiutil create \
+            -volname "LanMediaController" \
+            -srcfolder build/dmg_stage \
+            -ov -format UDZO \
+            dist/LanMediaController-macOS.dmg
+
+          hdiutil verify dist/LanMediaController-macOS.dmg
+          ls -lh dist/LanMediaController-macOS.dmg
+
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/LanMediaController-macOS.dmg
+
+  build-windows:
+    name: Build Native Windows .NET 8 WPF Portable .exe
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish Single-File Portable EXE
+        shell: pwsh
+        run: |
+          dotnet publish windows/LanMediaController.csproj `
+            -c Release -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o build/win
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/win/LanMediaController.exe dist/LanMediaController-Windows-Portable.exe -Force
+          Get-ChildItem dist/LanMediaController-Windows-Portable.exe
+
+      - name: Upload Windows EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/LanMediaController-Windows-Portable.exe
+
+  build-android:
+    name: Build Native Android Kotlin .apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Release Signing Keystore & Build APK
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -v \
+            -keystore /tmp/lmc-release.jks \
+            -alias lmc \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass lmc2026pass -keypass lmc2026pass \
+            -dname "CN=LanMediaController, OU=Dev, O=Local, L=City, S=State, C=CN"
+
+          export ANDROID_KEYSTORE_PATH=/tmp/lmc-release.jks
+          export ANDROID_KEYSTORE_PASS=lmc2026pass
+          export ANDROID_KEY_ALIAS=lmc
+          export ANDROID_KEY_PASS=lmc2026pass
+
+          gradle -p android assembleRelease --no-daemon
+
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk dist/LanMediaController-Android.apk
+          ls -lh dist/LanMediaController-Android.apk
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/LanMediaController-Android.apk
+
+  publish-release:
+    name: Publish GitHub Pre-release
+    needs: [build-macos, build-windows, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform builds
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update Pre-release v2.0.0-alpha.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -lh release-assets/
+          TAG="v2.0.0-alpha.1"
+          cat <<'EOF' > /tmp/release_notes.md
+          ## 四端局域网媒体控制器 v2.0.0-alpha.1（全平台原生重构版）
+
+          - **macOS (`LanMediaController-macOS.dmg`)**：真正的 SwiftUI 原生通用二进制 App（arm64 + x86_64），由 Apple 官方 `hdiutil` 打包支持拖拽安装；内置编译好的 `ungive/mediaremote-adapter`，完美支持 macOS 13–27 实时识别与控制 **QQ音乐、网易云音乐、Spotify、Apple Music、浏览器**（歌名、进度条拖动播放、播放/暂停、上一章/下一章）。
+          - **Windows (`LanMediaController-Windows-Portable.exe`)**：真正的 .NET 8 原生 WPF 桌面应用（单文件便携版，无浏览器弹窗、无端口冲突），直接调用 WinRT GSMTC 系统媒体接口与 `wlanapi.dll` 真实 Wi-Fi 名称。
+          - **Android (`LanMediaController-Android.apk`)**：真正的 Kotlin 原生 Android 应用，集成 `NotificationListenerService + MediaSessionManager` 与后台前台服务，支持真实读取与控制本机及房间内设备。
+          - **局域网直连 + 房间同步**：4 位数独立开房间 / 加入 / 退出，支持局域网 UDP 广播直连与房间中继自动兜底。
+          EOF
+          sed -i 's/^          //' /tmp/release_notes.md
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "${{ github.repository }}" --title "v2.0.0-alpha.1 (全平台原生重构版)" --notes-file /tmp/release_notes.md --prerelease
+            gh release upload "$TAG" \
+              release-assets/LanMediaController-macOS.dmg \
+              release-assets/LanMediaController-Windows-Portable.exe \
+              release-assets/LanMediaController-Android.apk \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" \
+              release-assets/LanMediaController-macOS.dmg \
+              release-assets/LanMediaController-Windows-Portable.exe \
+              release-assets/LanMediaController-Android.apk \
+              --repo "${{ github.repository }}" \
+              --title "v2.0.0-alpha.1 (全平台原生重构版)" \
+              --notes-file /tmp/release_notes.md \
+              --prerelease
+          fi

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>四端媒体控制器</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.liangyu.lanmediacontroller</string>
+    <key>CFBundleShortVersionString</key>
+    <string>2.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>200</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>用于在局域网内发现同一房间内的设备并同步控制媒体播放</string>
+    <key>NSAppleMusicUsageDescription</key>
+    <string>用于读取并控制当前正在播放的音乐</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

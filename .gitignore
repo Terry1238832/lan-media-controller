@@ -1,6 +1,27 @@
+# Build outputs
 dist/
-node_modules/
-*.keystore
-*.idsig
+build/
+*.dmg
+*.exe
+*.apk
+
+# macOS
 .DS_Store
-__pycache__/
+macos/build/
+macos/.build/
+
+# Windows / .NET
+windows/bin/
+windows/obj/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/*.jks
+android/*.keystore
+
+# iOS / Xcode
+ios/DerivedData/
+*.xcuserdata
