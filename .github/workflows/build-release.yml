@@ -102,6 +102,19 @@ jobs:
           name: macos-dmg
           path: dist/LanMediaController-macOS.dmg
 
+      - name: Verify iOS Xcode Project Compiles (iphoneos)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/LanMediaController.xcodeproj \
+            -scheme LanMediaController \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM="" \
+            build
+
   build-windows:
     name: Build Native Windows .NET 8 WPF Portable .exe
     runs-on: windows-latest
