@@ -151,6 +151,7 @@ final class IOSLocalMediaController {
     private var setElapsedPtr: MRSetElapsedFunc?
 
     // Tracks AVAudioSession detection & exclusive interruption for 喜马拉雅 / third-party audio
+    private var silentKeepAlivePlayer: AVAudioPlayer?
     private var holdingExclusiveInterrupt = false
     private var everSawExternalAudio = false
     private var externalAudioRunning = false
@@ -162,7 +163,7 @@ final class IOSLocalMediaController {
 
     init() {
         loadOptionalMediaRemote()
-        configurePassiveAudioSession()
+        configurePassiveKeepAliveSession()
         if let url = URL(string: "iting://") {
             ximalayaInstalled = UIApplication.shared.canOpenURL(url)
         }
@@ -175,6 +176,7 @@ final class IOSLocalMediaController {
     }
 
     deinit {
+        silentKeepAlivePlayer?.stop()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -190,10 +192,53 @@ final class IOSLocalMediaController {
         }
     }
 
-    private func configurePassiveAudioSession() {
+    /// Uses `.playback` + `[.mixWithOthers]` with a 0-volume silent PCM loop so iOS keeps
+    /// LAN sync & 喜马拉雅 detection alive in the background without ever interrupting other apps.
+    private func configurePassiveKeepAliveSession() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
-        try? session.setActive(true)
+        do {
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+            startSilentKeepAliveIfNeeded()
+        } catch {
+            try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+            try? session.setActive(true)
+        }
+    }
+
+    private func startSilentKeepAliveIfNeeded() {
+        if let p = silentKeepAlivePlayer, p.isPlaying { return }
+        let wavData = Self.makeSilentWavData()
+        if let player = try? AVAudioPlayer(data: wavData) {
+            player.numberOfLoops = -1
+            player.volume = 0.0
+            player.prepareToPlay()
+            player.play()
+            silentKeepAlivePlayer = player
+        }
+    }
+
+    private static func makeSilentWavData() -> Data {
+        let sampleRate: UInt32 = 8000
+        let numSamples: UInt32 = 8000 // 1 second of silence
+        let dataSize: UInt32 = numSamples * 2
+        let fileSize: UInt32 = 36 + dataSize
+        var d = Data()
+        d.append(contentsOf: "RIFF".utf8)
+        d.append(contentsOf: withUnsafeBytes(of: fileSize.littleEndian) { Array($0) })
+        d.append(contentsOf: "WAVE".utf8)
+        d.append(contentsOf: "fmt ".utf8)
+        d.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian) { Array($0) })
+        d.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // PCM
+        d.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // Mono
+        d.append(contentsOf: withUnsafeBytes(of: sampleRate.littleEndian) { Array($0) })
+        d.append(contentsOf: withUnsafeBytes(of: (sampleRate * 2).littleEndian) { Array($0) })
+        d.append(contentsOf: withUnsafeBytes(of: UInt16(2).littleEndian) { Array($0) })
+        d.append(contentsOf: withUnsafeBytes(of: UInt16(16).littleEndian) { Array($0) })
+        d.append(contentsOf: "data".utf8)
+        d.append(contentsOf: withUnsafeBytes(of: dataSize.littleEndian) { Array($0) })
+        d.append(Data(count: Int(dataSize)))
+        return d
     }
 
     @objc private func handleSecondaryAudioHint(_ note: Notification) {
@@ -334,6 +379,7 @@ final class IOSLocalMediaController {
 
     /// Activates an exclusive non-mixing AVAudioSession so iOS sends `.interruptionNotification (.began)` to 喜马拉雅 (pausing it!)
     private func interruptExternalAudioToPause() {
+        silentKeepAlivePlayer?.stop()
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playback, mode: .default, options: [])
@@ -341,19 +387,20 @@ final class IOSLocalMediaController {
             holdingExclusiveInterrupt = true
             everSawExternalAudio = true
         } catch {
-            configurePassiveAudioSession()
+            configurePassiveKeepAliveSession()
         }
     }
 
     /// Deactivates the exclusive session with `.notifyOthersOnDeactivation` so iOS sends `.shouldResume` to 喜马拉雅!
     private func releaseInterruptToResumeExternalAudio() {
+        silentKeepAlivePlayer?.stop()
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setActive(false, options: .notifyOthersOnDeactivation)
         } catch {}
         holdingExclusiveInterrupt = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.configurePassiveAudioSession()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            self?.configurePassiveKeepAliveSession()
             self?.pollAndEmit()
         }
     }
@@ -645,7 +692,7 @@ final class MediaRemoteBridge: ObservableObject {
         tickCounter += 1
         if tickCounter % 10 == 0 { refreshNetworkInfo() }
         pruneStalePeers()
-        broadcastPresence(includeRelay: tickCounter % 2 == 0)
+        broadcastPresence(includeRelay: tickCounter % 5 == 0)
     }
 
     private func refreshNetworkInfo() {
@@ -852,6 +899,14 @@ final class MediaRemoteBridge: ObservableObject {
         targets.insert(Self.multicastGroup)
         targets.insert("255.255.255.255")
 
+        var knownPeerEndpoints: [(ip: String, port: Int)] = []
+        for peer in allPeersById.values where !peer.ip.isEmpty {
+            targets.insert(peer.ip)
+            if peer.httpPort > 0 {
+                knownPeerEndpoints.append((peer.ip, peer.httpPort))
+            }
+        }
+
         let fd = udpSocket
         if fd >= 0 {
             netQueue.async {
@@ -860,6 +915,19 @@ final class MediaRemoteBridge: ObservableObject {
                 }
             }
         }
+
+        // Push presence directly over TCP HTTP to known LAN peers (works even if router drops Wi-Fi UDP broadcast!)
+        for ep in knownPeerEndpoints {
+            if let url = URL(string: "http://\(ep.ip):\(ep.port)/api/presence") {
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.timeoutInterval = 1.5
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = data
+                URLSession.shared.dataTask(with: req).resume()
+            }
+        }
+
         if includeRelay && !homeRelayTopic.isEmpty {
             publishToHomeRelay(payload: packet)
         }
@@ -1041,7 +1109,7 @@ final class MediaRemoteBridge: ObservableObject {
     private func pruneStalePeers() {
         let now = iosNowMillis()
         let before = allPeersById.count
-        allPeersById = allPeersById.filter { now - $0.value.lastSeen < 14_000 }
+        allPeersById = allPeersById.filter { now - $0.value.lastSeen < 25_000 }
         if allPeersById.count != before { rebuildDerivedLists() }
     }
 

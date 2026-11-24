@@ -24,6 +24,10 @@
     <true/>
     <key>UILaunchScreen</key>
     <dict/>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
     <key>NSLocalNetworkUsageDescription</key>
     <string>用于在局域网内发现同一房间内的设备并同步控制媒体播放</string>
     <key>NSBonjourServices</key>

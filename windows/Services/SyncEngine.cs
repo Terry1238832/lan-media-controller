@@ -17,8 +17,8 @@ public sealed class SyncEngine : IDisposable
     public const string RelayBase = "https://ntfy.sh";
 
     private readonly WindowsMediaController _media = new();
-    private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(3) };
-    private readonly HttpClient _sseClient = new() { Timeout = Timeout.InfiniteTimeSpan };
+    private readonly HttpClient _httpClient;
+    private readonly HttpClient _sseClient;
     private readonly object _stateLock = new();
 
     private readonly Dictionary<string, DeviceRecord> _allPeersById = new();
@@ -55,10 +55,100 @@ public sealed class SyncEngine : IDisposable
 
     public SyncEngine()
     {
+        _httpClient = new HttpClient(CreateHappyEyeballsHandler()) { Timeout = TimeSpan.FromSeconds(8) };
+        _sseClient = new HttpClient(CreateHappyEyeballsHandler()) { Timeout = Timeout.InfiniteTimeSpan };
+
         LoadOrCreateConfig();
         // Default on launch: immediately host our own room named "<DeviceName>的房间"
         CurrentRoomId = DeviceId;
         CurrentRoomName = $"{DeviceName}的房间";
+    }
+
+    /// <summary>
+    /// RFC 8305 Happy Eyeballs: races IPv6 and IPv4 connections so dead IPv4 routes
+    /// (e.g. unreachable ntfy.sh IPv4 while IPv6 connects in 100ms) never stall HttpClient.
+    /// </summary>
+    private static SocketsHttpHandler CreateHappyEyeballsHandler()
+    {
+        return new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            ConnectCallback = async (context, ct) =>
+            {
+                var host = context.DnsEndPoint.Host;
+                var port = context.DnsEndPoint.Port;
+
+                if (IPAddress.TryParse(host, out var directIp))
+                {
+                    var s = new Socket(directIp.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                    try
+                    {
+                        await s.ConnectAsync(new IPEndPoint(directIp, port), ct);
+                        return new NetworkStream(s, ownsSocket: true);
+                    }
+                    catch
+                    {
+                        s.Dispose();
+                        throw;
+                    }
+                }
+
+                var addresses = await Dns.GetHostAddressesAsync(host, ct);
+                if (addresses.Length == 0)
+                    throw new SocketException((int)SocketError.HostNotFound);
+
+                // Interleave IPv6 and IPv4 addresses and race them in parallel
+                var v6 = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetworkV6).ToList();
+                var v4 = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToList();
+                var ordered = new List<IPAddress>();
+                int max = Math.Max(v6.Count, v4.Count);
+                for (int i = 0; i < max; i++)
+                {
+                    if (i < v6.Count) ordered.Add(v6[i]);
+                    if (i < v4.Count) ordered.Add(v4[i]);
+                }
+
+                using var raceCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var tasks = ordered.Select(async addr =>
+                {
+                    var sock = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                    try
+                    {
+                        await sock.ConnectAsync(new IPEndPoint(addr, port), raceCts.Token);
+                        return sock;
+                    }
+                    catch
+                    {
+                        sock.Dispose();
+                        throw;
+                    }
+                }).ToList();
+
+                Exception? lastEx = null;
+                while (tasks.Count > 0)
+                {
+                    var finished = await Task.WhenAny(tasks);
+                    tasks.Remove(finished);
+                    if (finished.IsCompletedSuccessfully)
+                    {
+                        var winner = finished.Result;
+                        raceCts.Cancel();
+                        // Dispose any late-winning sockets cleanly
+                        foreach (var remaining in tasks)
+                        {
+                            _ = remaining.ContinueWith(t =>
+                            {
+                                if (t.IsCompletedSuccessfully) t.Result.Dispose();
+                            }, TaskScheduler.Default);
+                        }
+                        return new NetworkStream(winner, ownsSocket: true);
+                    }
+                    lastEx = finished.Exception?.GetBaseException();
+                }
+
+                throw lastEx ?? new SocketException((int)SocketError.NetworkUnreachable);
+            }
+        };
     }
 
     private void LoadOrCreateConfig()
@@ -250,7 +340,7 @@ public sealed class SyncEngine : IDisposable
         _heartbeatTick++;
         if (_heartbeatTick % 10 == 0) RefreshNetworkInfo();
         PruneStalePeers();
-        BroadcastPresence(includeRelay: _heartbeatTick % 2 == 0);
+        BroadcastPresence(includeRelay: _heartbeatTick % 5 == 0);
     }
 
     private void RefreshNetworkInfo()
@@ -483,12 +573,41 @@ public sealed class SyncEngine : IDisposable
         };
 
         var targets = new HashSet<string>(_broadcastAddresses) { MulticastGroup, "255.255.255.255" };
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet, ProtocolJson.Options));
+        List<(string ip, int port)> knownPeers;
+        lock (_stateLock)
+        {
+            knownPeers = _allPeersById.Values
+                .Where(p => !string.IsNullOrEmpty(p.Ip))
+                .Select(p => (p.Ip, p.HttpPort))
+                .Distinct()
+                .ToList();
+        }
+        foreach (var kp in knownPeers) targets.Add(kp.ip);
+
+        var json = JsonSerializer.Serialize(packet, ProtocolJson.Options);
+        var bytes = Encoding.UTF8.GetBytes(json);
         foreach (var host in targets)
             SendUdpBytes(bytes, host);
 
+        // Also push presence directly via TCP HTTP to known LAN peers (bypasses router broadcast drops!)
+        foreach (var (ip, port) in knownPeers)
+        {
+            if (port > 0)
+                _ = PostRawJsonAsync($"http://{ip}:{port}/api/presence", json);
+        }
+
         if (includeRelay && !string.IsNullOrEmpty(_homeRelayTopic))
             _ = PublishToHomeRelayAsync(packet);
+    }
+
+    private async Task PostRawJsonAsync(string url, string json)
+    {
+        try
+        {
+            using var content = new StringContent(json, Encoding.UTF8, "application/json");
+            await _httpClient.PostAsync(url, content);
+        }
+        catch { }
     }
 
     private void SendLeave(string roomId)
@@ -739,7 +858,7 @@ public sealed class SyncEngine : IDisposable
         bool changed = false;
         lock (_stateLock)
         {
-            var stale = _allPeersById.Where(kv => now - kv.Value.LastSeen > 14000).Select(kv => kv.Key).ToList();
+            var stale = _allPeersById.Where(kv => now - kv.Value.LastSeen > 25000).Select(kv => kv.Key).ToList();
             foreach (var id in stale) { _allPeersById.Remove(id); changed = true; }
         }
         if (changed) NotifyUpdated();

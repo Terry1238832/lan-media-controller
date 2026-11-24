@@ -189,7 +189,7 @@ final class SyncEngine: ObservableObject {
             refreshNetworkInfo()
         }
         pruneStalePeers()
-        broadcastPresence(includeRelay: netRefreshCounter % 2 == 0)
+        broadcastPresence(includeRelay: netRefreshCounter % 5 == 0)
     }
 
     private func refreshNetworkInfo() {
@@ -414,12 +414,31 @@ final class SyncEngine: ObservableObject {
         targets.insert(SyncEngine.multicastGroup)
         targets.insert("255.255.255.255")
 
+        var knownPeerEndpoints: [(ip: String, port: Int)] = []
+        for peer in allPeersById.values where !peer.ip.isEmpty {
+            targets.insert(peer.ip)
+            if peer.httpPort > 0 {
+                knownPeerEndpoints.append((peer.ip, peer.httpPort))
+            }
+        }
+
         let fd = udpSocket
         if fd >= 0 {
             netQueue.async {
                 for host in targets {
                     Self.sendUDPData(fd: fd, data: data, host: host, port: SyncEngine.udpPort)
                 }
+            }
+        }
+
+        for ep in knownPeerEndpoints {
+            if let url = URL(string: "http://\(ep.ip):\(ep.port)/api/presence") {
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.timeoutInterval = 1.5
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = data
+                URLSession.shared.dataTask(with: req).resume()
             }
         }
 
@@ -642,7 +661,7 @@ final class SyncEngine: ObservableObject {
     private func pruneStalePeers() {
         let now = nowMillis()
         let before = allPeersById.count
-        allPeersById = allPeersById.filter { now - $0.value.lastSeen < 14_000 }
+        allPeersById = allPeersById.filter { now - $0.value.lastSeen < 25_000 }
         if allPeersById.count != before {
             rebuildDerivedLists()
         }

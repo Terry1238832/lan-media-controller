@@ -117,7 +117,7 @@ object SyncEngine {
                 if (tickCount % 10 == 0) refreshNetworkInfo()
                 AndroidMediaController.refreshState()
                 pruneStalePeers()
-                broadcastPresence(includeRelay = tickCount % 2 == 0)
+                broadcastPresence(includeRelay = tickCount % 5 == 0)
             } catch (_: Exception) {}
         }, 400, 1500, TimeUnit.MILLISECONDS)
     }
@@ -428,7 +428,15 @@ object SyncEngine {
         targets.addAll(broadcastAddresses)
         targets.add(MULTICAST_GROUP)
         targets.add("255.255.255.255")
+
+        val peerEndpoints = synchronized(lock) {
+            allPeersById.values.filter { it.ip.isNotEmpty() }.map { it.ip to it.httpPort }.distinct()
+        }
+        for ((ip, _) in peerEndpoints) targets.add(ip)
         for (host in targets) sendUdpString(json, host)
+        for ((ip, port) in peerEndpoints) {
+            if (port > 0) ioExecutor.execute { sendHttpPost("http://$ip:$port/api/presence", json) }
+        }
 
         val topic = homeRelayTopic
         if (includeRelay && topic.isNotEmpty()) {
@@ -606,7 +614,7 @@ object SyncEngine {
         val now = System.currentTimeMillis()
         var changed = false
         synchronized(lock) {
-            val stale = allPeersById.filterValues { now - it.lastSeen > 14_000 }.keys.toList()
+            val stale = allPeersById.filterValues { now - it.lastSeen > 25_000 }.keys.toList()
             for (id in stale) { allPeersById.remove(id); changed = true }
         }
         if (changed) notifyUpdated()

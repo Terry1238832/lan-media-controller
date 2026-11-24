@@ -172,8 +172,11 @@ public static class WindowsNetworkInfo
 
             foreach (var nic in nics)
             {
-                var desc = nic.Description.ToLowerInvariant();
-                if (desc.Contains("virtual") || desc.Contains("vmware") || desc.Contains("hyper-v") || desc.Contains("wsl") || desc.Contains("vethernet"))
+                var desc = (nic.Description + " " + nic.Name).ToLowerInvariant();
+                if (desc.Contains("virtual") || desc.Contains("vmware") || desc.Contains("hyper-v")
+                    || desc.Contains("wsl") || desc.Contains("vethernet") || desc.Contains("radmin")
+                    || desc.Contains("zerotier") || desc.Contains("tailscale") || desc.Contains("wireguard")
+                    || desc.Contains("tap-") || desc.Contains("wintun") || desc.Contains("openvpn"))
                     continue;
 
                 var props = nic.GetIPProperties();
