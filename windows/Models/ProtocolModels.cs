@@ -86,7 +86,8 @@ public sealed class DeviceRecord
     public string DeviceId { get; set; } = "";
     public string DeviceName { get; set; } = "";
     public string Platform { get; set; } = "windows";
-    public string RoomCode { get; set; } = "";
+    public string RoomId { get; set; } = "";
+    public string RoomName { get; set; } = "";
     public string LanName { get; set; } = "";
     public string Ip { get; set; } = "";
     public string Subnet { get; set; } = "";
@@ -97,6 +98,15 @@ public sealed class DeviceRecord
     public PlayerState Player { get; set; } = new();
 }
 
+public sealed class AvailableRoom
+{
+    public string RoomId { get; set; } = "";
+    public string RoomName { get; set; } = "";
+    public string HostPlatform { get; set; } = "windows";
+    public int MemberCount { get; set; }
+    public bool IsLanDirect { get; set; }
+}
+
 public sealed class PresencePacket
 {
     public int V { get; set; } = 2;
@@ -104,7 +114,8 @@ public sealed class PresencePacket
     public string DeviceId { get; set; } = "";
     public string DeviceName { get; set; } = "";
     public string Platform { get; set; } = "windows";
-    public string RoomCode { get; set; } = "";
+    public string RoomId { get; set; } = "";
+    public string RoomName { get; set; } = "";
     public string LanName { get; set; } = "";
     public string Ip { get; set; } = "";
     public string Subnet { get; set; } = "";
@@ -118,7 +129,7 @@ public sealed class LeavePacket
     public int V { get; set; } = 2;
     public string Type { get; set; } = "leave";
     public string DeviceId { get; set; } = "";
-    public string RoomCode { get; set; } = "";
+    public string RoomId { get; set; } = "";
     public long Ts { get; set; }
 }
 
@@ -127,7 +138,7 @@ public sealed class CommandPacket
     public int V { get; set; } = 2;
     public string Type { get; set; } = "command";
     public string CmdId { get; set; } = "";
-    public string RoomCode { get; set; } = "";
+    public string RoomId { get; set; } = "";
     public string TargetDeviceId { get; set; } = "";
     public string Action { get; set; } = "toggle";
     public double Position { get; set; }

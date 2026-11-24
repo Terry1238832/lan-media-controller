@@ -69,7 +69,8 @@ data class DeviceRecord(
     val deviceId: String,
     val deviceName: String,
     val platform: String,
-    val roomCode: String,
+    val roomId: String,
+    val roomName: String,
     val lanName: String,
     val ip: String,
     val subnet: String,
@@ -78,6 +79,14 @@ data class DeviceRecord(
     val lastPacketTs: Long,
     val connectionMode: String,
     val player: PlayerState
+)
+
+data class AvailableRoom(
+    val roomId: String,
+    val roomName: String,
+    val hostPlatform: String,
+    val memberCount: Int,
+    val isLanDirect: Boolean
 )
 
 object FormatUtil {

@@ -1,18 +1,28 @@
-# LanMediaController v2 Sync Protocol
+# LanMediaController v2.1 Auto-Host Room Protocol
 
-All 4 native clients (`macOS`, `Windows`, `Android`, `iOS`) implement this unified JSON protocol.
+All 4 native clients (`macOS`, `Windows`, `Android`, `iOS`) implement this unified JSON protocol with **zero matching codes**:
 
-## Transport Layers
+## Room Behavior
 
-1. **Primary (Direct LAN, < 5ms, works offline)**:
-   - **UDP Discovery & Presence**: Port `41234`
-     - Broadcasts to `255.255.255.255`, all active IPv4 subnet directed broadcast addresses (e.g. `192.168.x.255`), and multicast `239.255.42.99:41234`.
-   - **Direct HTTP Control Server**: Port `41235` (auto-fallback `41235..41245`)
-     - `POST /api/command` accepts a `CommandPacket` JSON body.
-2. **Secondary (Automatic Room Relay Fallback)**:
-   - Active only when joined to a 4-digit room (`lmc_v2_r_<roomCode>`).
-   - Ensures Windows/macOS/Android/iOS still see and control each other even when Windows Firewall or router AP isolation blocks inbound LAN packets.
-   - All messages are deduplicated via `cmdId` and monotonic `ts`.
+1. **Auto-Host on Startup**:
+   - Every device automatically opens and hosts its own room upon launch:
+     - `roomId = deviceId`
+     - `roomName = "<deviceName>的房间"`
+   - Renaming the device updates `roomName` automatically when hosting its own room.
+2. **One-Click Join**:
+   - Devices discover all other active rooms on the same network and display them in **"可加入的其他设备房间"**.
+   - Clicking **加入** switches `currentRoomId` and `currentRoomName` to the selected room.
+   - Clicking **回到我的房间** sends a `leave` packet and returns to hosting `"<deviceName>的房间"`.
+
+## Dual-Layer Transport
+
+1. **Primary — Direct LAN (< 5ms, works offline)**:
+   - UDP Discovery & Presence on port `41234` (directed subnet broadcasts + `255.255.255.255` + multicast `239.255.42.99:41234`).
+   - Direct LAN HTTP control endpoint on port `41235` (`41235..41245` auto-fallback): `POST /api/command`.
+2. **Secondary — Automatic Same-Network Discovery Relay**:
+   - Computes `SHA-256("lmc-v2-home:" + publicIPv4)[0..16]` via `https://api4.ipify.org` (fallback `https://ipv4.icanhazip.com`).
+   - Ensures devices behind the same home router immediately see each other's rooms and control each other even when Windows Firewall or router AP isolation blocks inbound LAN UDP/TCP packets.
+   - Deduplicated via `cmdId` and monotonic `ts`.
 
 ## Message Schemas
 
@@ -21,10 +31,11 @@ All 4 native clients (`macOS`, `Windows`, `Android`, `iOS`) implement this unifi
 {
   "v": 2,
   "type": "presence",
-  "deviceId": "dev-a1b2c3d4",
+  "deviceId": "mac-a1b2c3d4",
   "deviceName": "MacBook Air",
   "platform": "macos",
-  "roomCode": "3849",
+  "roomId": "mac-a1b2c3d4",
+  "roomName": "MacBook Air的房间",
   "lanName": "HomeWiFi",
   "ip": "192.168.1.25",
   "subnet": "192.168.1",
@@ -49,8 +60,8 @@ All 4 native clients (`macOS`, `Windows`, `Android`, `iOS`) implement this unifi
   "v": 2,
   "type": "command",
   "cmdId": "cmd-9f8e7d6c",
-  "roomCode": "3849",
-  "targetDeviceId": "dev-a1b2c3d4",
+  "roomId": "mac-a1b2c3d4",
+  "targetDeviceId": "mac-a1b2c3d4",
   "action": "seek",
   "position": 90.0,
   "ts": 1732400000000
@@ -63,8 +74,8 @@ Supported `action` values: `"seek"` (seek + play), `"prev"`, `"toggle"`, `"play"
 {
   "v": 2,
   "type": "leave",
-  "deviceId": "dev-a1b2c3d4",
-  "roomCode": "3849",
+  "deviceId": "win-2dbac610",
+  "roomId": "mac-a1b2c3d4",
   "ts": 1732400000000
 }
 ```

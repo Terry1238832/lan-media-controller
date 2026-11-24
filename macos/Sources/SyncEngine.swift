@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import CryptoKit
 import Darwin
 
 @MainActor
@@ -9,19 +10,23 @@ final class SyncEngine: ObservableObject {
     static let relayBase = "https://ntfy.sh"
 
     @Published var deviceName: String
-    @Published var currentRoomCode: String = ""
+    @Published var currentRoomId: String
+    @Published var currentRoomName: String
     @Published var displayedLanName: String = "正在检测局域网..."
     @Published var localIP: String = ""
     @Published var localPlayer: PlayerState = PlayerState()
     @Published var roomPeers: [DeviceRecord] = []
-    @Published var discoveredRooms: [String] = []
+    @Published var availableRooms: [AvailableRoom] = []
     @Published var uiTick: Int64 = nowMillis()
 
     let deviceId: String
+    var isHostingOwnRoom: Bool { currentRoomId == deviceId }
+
     private var localSubnet: String = ""
     private var resolvedRealSSID: String = ""
     private var broadcastAddresses: [String] = ["255.255.255.255"]
     private var httpPort: Int = 41235
+    private var homeRelayTopic: String = ""
 
     private let mediaController = MacMediaController()
     private let netQueue = DispatchQueue(label: "com.local.lanmediacontroller.net", qos: .utility)
@@ -35,27 +40,33 @@ final class SyncEngine: ObservableObject {
     private var uiTickerTimer: Timer?
     private var netRefreshCounter = 0
 
-    private var peersById: [String: DeviceRecord] = [:]
-    private var discoveredRoomsMap: [String: Int64] = [:]
+    // All discovered peers on the LAN / Home network (both in our room and in other rooms)
+    private var allPeersById: [String: DeviceRecord] = [:]
     private var executedCmdIds: Set<String> = []
     private var startupMs: Int64 = nowMillis()
 
     init() {
         let defaults = UserDefaults.standard
+        let resolvedId: String
         if let savedId = defaults.string(forKey: "lmc_v2_device_id"), !savedId.isEmpty {
-            self.deviceId = savedId
+            resolvedId = savedId
         } else {
             let newId = "mac-" + UUID().uuidString.prefix(8).lowercased()
             defaults.set(newId, forKey: "lmc_v2_device_id")
-            self.deviceId = newId
+            resolvedId = newId
         }
+        self.deviceId = resolvedId
 
+        let resolvedName: String
         if let savedName = defaults.string(forKey: "lmc_v2_device_name"), !savedName.isEmpty {
-            self.deviceName = savedName
+            resolvedName = savedName
         } else {
-            let host = Host.current().localizedName ?? "Mac"
-            self.deviceName = host
+            resolvedName = Host.current().localizedName ?? "Mac"
         }
+        self.deviceName = resolvedName
+        // Default on launch: immediately host our own room named "<deviceName>的房间"
+        self.currentRoomId = resolvedId
+        self.currentRoomName = "\(resolvedName)的房间"
     }
 
     func start() {
@@ -64,12 +75,13 @@ final class SyncEngine: ObservableObject {
         refreshNetworkInfo()
         startUDP()
         startHTTPServer(startingPort: 41235)
+        resolveHomeRelayAndConnect()
 
         mediaController.onStateChanged = { [weak self] state in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.localPlayer = state
-                self.broadcastPresence(includeRelay: !self.currentRoomCode.isEmpty)
+                self.broadcastPresence(includeRelay: true)
             }
         }
         mediaController.start()
@@ -107,51 +119,45 @@ final class SyncEngine: ObservableObject {
         guard !trimmed.isEmpty else { return }
         deviceName = trimmed
         UserDefaults.standard.set(trimmed, forKey: "lmc_v2_device_name")
-        broadcastPresence(includeRelay: !currentRoomCode.isEmpty)
-    }
-
-    func createRoom() {
-        let code = String(format: "%04d", Int.random(in: 1000...9999))
-        joinRoom(code: code)
-    }
-
-    func joinRoom(code: String) {
-        let cleaned = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard cleaned.count == 4, cleaned.allSatisfy({ $0.isNumber }) else { return }
-        if !currentRoomCode.isEmpty && currentRoomCode != cleaned {
-            sendLeave(roomCode: currentRoomCode)
+        if currentRoomId == deviceId {
+            currentRoomName = "\(trimmed)的房间"
         }
-        currentRoomCode = cleaned
-        peersById.removeAll()
-        roomPeers = []
-        startRelaySubscription(for: cleaned)
         broadcastPresence(includeRelay: true)
     }
 
-    func leaveRoom() {
-        let old = currentRoomCode
-        currentRoomCode = ""
-        relayTask?.cancel()
-        relayTask = nil
-        peersById.removeAll()
-        roomPeers = []
-        if !old.isEmpty {
-            sendLeave(roomCode: old)
+    func joinRoom(_ room: AvailableRoom) {
+        guard room.id != currentRoomId else { return }
+        let oldRoom = currentRoomId
+        if !oldRoom.isEmpty {
+            sendLeave(roomId: oldRoom)
         }
-        broadcastPresence(includeRelay: false)
+        currentRoomId = room.id
+        currentRoomName = room.roomName
+        rebuildDerivedLists()
+        broadcastPresence(includeRelay: true)
+    }
+
+    func returnToOwnRoom() {
+        guard currentRoomId != deviceId else { return }
+        let oldRoom = currentRoomId
+        sendLeave(roomId: oldRoom)
+        currentRoomId = deviceId
+        currentRoomName = "\(deviceName)的房间"
+        rebuildDerivedLists()
+        broadcastPresence(includeRelay: true)
     }
 
     func sendCommand(to targetDeviceId: String, action: String, position: Double = 0) {
         if targetDeviceId == deviceId {
             applyOptimisticLocal(action: action, position: position)
             mediaController.execute(action: action, position: position)
-            broadcastPresence(includeRelay: !currentRoomCode.isEmpty)
+            broadcastPresence(includeRelay: true)
             return
         }
 
         let cmd = CommandPacket(
             cmdId: "cmd-\(UUID().uuidString.prefix(8).lowercased())",
-            roomCode: currentRoomCode,
+            roomId: currentRoomId,
             targetDeviceId: targetDeviceId,
             action: action,
             position: position,
@@ -159,10 +165,10 @@ final class SyncEngine: ObservableObject {
         )
         executedCmdIds.insert(cmd.cmdId)
 
-        if var peer = peersById[targetDeviceId] {
+        if var peer = allPeersById[targetDeviceId] {
             applyOptimistic(player: &peer.player, action: action, position: position)
-            peersById[targetDeviceId] = peer
-            publishSortedPeers()
+            allPeersById[targetDeviceId] = peer
+            rebuildDerivedLists()
 
             if !peer.ip.isEmpty && peer.httpPort > 0 {
                 sendHTTPCommand(cmd, ip: peer.ip, port: peer.httpPort)
@@ -170,8 +176,8 @@ final class SyncEngine: ObservableObject {
             }
         }
 
-        if !currentRoomCode.isEmpty {
-            publishToRelay(roomCode: currentRoomCode, payload: cmd)
+        if !homeRelayTopic.isEmpty {
+            publishToHomeRelay(payload: cmd)
         }
     }
 
@@ -183,7 +189,7 @@ final class SyncEngine: ObservableObject {
             refreshNetworkInfo()
         }
         pruneStalePeers()
-        broadcastPresence(includeRelay: !currentRoomCode.isEmpty && (netRefreshCounter % 2 == 0))
+        broadcastPresence(includeRelay: netRefreshCounter % 2 == 0)
     }
 
     private func refreshNetworkInfo() {
@@ -218,6 +224,78 @@ final class SyncEngine: ObservableObject {
         guard MacNetworkInfo.isValidSSID(candidate) else { return }
         resolvedRealSSID = candidate
         updateDisplayedLanName()
+    }
+
+    // MARK: - Home NAT Discovery Channel (Zero-Code Firewall Bypass)
+
+    private func resolveHomeRelayAndConnect() {
+        Task { [weak self] in
+            let endpoints = ["https://api4.ipify.org", "https://ipv4.icanhazip.com"]
+            var publicIP = ""
+            for ep in endpoints {
+                guard let url = URL(string: ep) else { continue }
+                var req = URLRequest(url: url)
+                req.timeoutInterval = 3.0
+                if let (data, _) = try? await URLSession.shared.data(for: req),
+                   let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   str.split(separator: ".").count == 4 {
+                    publicIP = str
+                    break
+                }
+            }
+            guard !publicIP.isEmpty else { return }
+            let digest = SHA256.hash(data: Data("lmc-v2-home:\(publicIP)".utf8))
+            let hex = digest.map { String(format: "%02x", $0) }.joined()
+            let topic = "lmc_v2_home_\(hex.prefix(16))"
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.homeRelayTopic = topic
+                self.startRelaySubscription(topic: topic)
+                self.broadcastPresence(includeRelay: true)
+            }
+        }
+    }
+
+    private func startRelaySubscription(topic: String) {
+        relayTask?.cancel()
+        guard let url = URL(string: "\(SyncEngine.relayBase)/\(topic)/sse?since=1m") else { return }
+
+        relayTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    var req = URLRequest(url: url)
+                    req.timeoutInterval = 300
+                    let (bytes, _) = try await URLSession.shared.bytes(for: req)
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        guard line.hasPrefix("data:") else { continue }
+                        let jsonPart = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        guard let outerData = jsonPart.data(using: .utf8),
+                              let outer = try? JSONSerialization.jsonObject(with: outerData) as? [String: Any],
+                              (outer["event"] as? String) == "message",
+                              let msgStr = outer["message"] as? String,
+                              let msgData = msgStr.data(using: .utf8) else { continue }
+                        await MainActor.run { [weak self] in
+                            self?.handleIncomingPacket(data: msgData, source: .relay, senderIP: "")
+                        }
+                    }
+                } catch {
+                    if Task.isCancelled { break }
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+            }
+        }
+    }
+
+    private func publishToHomeRelay<T: Encodable>(payload: T) {
+        guard !homeRelayTopic.isEmpty,
+              let url = URL(string: "\(SyncEngine.relayBase)/\(homeRelayTopic)"),
+              let body = try? JSONEncoder().encode(payload) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 3.0
+        req.httpBody = body
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     // MARK: - Optimistic Updates
@@ -321,7 +399,8 @@ final class SyncEngine: ObservableObject {
             deviceId: deviceId,
             deviceName: deviceName,
             platform: PlatformType.macos.rawValue,
-            roomCode: currentRoomCode,
+            roomId: currentRoomId,
+            roomName: currentRoomName,
             lanName: resolvedRealSSID,
             ip: localIP,
             subnet: localSubnet,
@@ -344,13 +423,13 @@ final class SyncEngine: ObservableObject {
             }
         }
 
-        if includeRelay && !currentRoomCode.isEmpty {
-            publishToRelay(roomCode: currentRoomCode, payload: packet)
+        if includeRelay && !homeRelayTopic.isEmpty {
+            publishToHomeRelay(payload: packet)
         }
     }
 
-    private func sendLeave(roomCode: String) {
-        let packet = LeavePacket(deviceId: deviceId, roomCode: roomCode, ts: nowMillis())
+    private func sendLeave(roomId: String) {
+        let packet = LeavePacket(deviceId: deviceId, roomId: roomId, ts: nowMillis())
         guard let data = try? JSONEncoder().encode(packet) else { return }
 
         var targets = Set(broadcastAddresses)
@@ -363,7 +442,7 @@ final class SyncEngine: ObservableObject {
                 }
             }
         }
-        publishToRelay(roomCode: roomCode, payload: packet)
+        publishToHomeRelay(payload: packet)
     }
 
     private func sendUDPDirect(_ cmd: CommandPacket, ip: String) {
@@ -472,51 +551,6 @@ final class SyncEngine: ObservableObject {
         URLSession.shared.dataTask(with: req).resume()
     }
 
-    // MARK: - Room-Scoped Relay Fallback (Firewall / AP Isolation Traversal)
-
-    private func startRelaySubscription(for roomCode: String) {
-        relayTask?.cancel()
-        let topic = "lmc_v2_r_\(roomCode)"
-        guard let url = URL(string: "\(SyncEngine.relayBase)/\(topic)/sse?since=2m") else { return }
-
-        relayTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    var req = URLRequest(url: url)
-                    req.timeoutInterval = 300
-                    let (bytes, _) = try await URLSession.shared.bytes(for: req)
-                    for try await line in bytes.lines {
-                        if Task.isCancelled { break }
-                        guard line.hasPrefix("data:") else { continue }
-                        let jsonPart = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                        guard let outerData = jsonPart.data(using: .utf8),
-                              let outer = try? JSONSerialization.jsonObject(with: outerData) as? [String: Any],
-                              (outer["event"] as? String) == "message",
-                              let msgStr = outer["message"] as? String,
-                              let msgData = msgStr.data(using: .utf8) else { continue }
-                        await MainActor.run { [weak self] in
-                            self?.handleIncomingPacket(data: msgData, source: .relay, senderIP: "")
-                        }
-                    }
-                } catch {
-                    if Task.isCancelled { break }
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                }
-            }
-        }
-    }
-
-    private func publishToRelay<T: Encodable>(roomCode: String, payload: T) {
-        let topic = "lmc_v2_r_\(roomCode)"
-        guard let url = URL(string: "\(SyncEngine.relayBase)/\(topic)"),
-              let body = try? JSONEncoder().encode(payload) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 3.0
-        req.httpBody = body
-        URLSession.shared.dataTask(with: req).resume()
-    }
-
     // MARK: - Unified Incoming Packet Handler
 
     private func handleIncomingPacket(data: Data, source: ConnectionMode, senderIP: String) {
@@ -526,26 +560,29 @@ final class SyncEngine: ObservableObject {
         let now = nowMillis()
 
         if type == "presence", let pkt = try? JSONDecoder().decode(PresencePacket.self, from: data) {
-            guard pkt.deviceId != deviceId else { return }
+            guard !pkt.deviceId.isEmpty && pkt.deviceId != deviceId else { return }
 
             adoptSubnetLanNameIfValid(pkt.lanName, peerSubnet: pkt.subnet)
 
-            if source == .lan && pkt.roomCode.count == 4 && pkt.roomCode.allSatisfy({ $0.isNumber }) {
-                discoveredRoomsMap[pkt.roomCode] = now
-                publishDiscoveredRooms()
+            let effectiveIP = !senderIP.isEmpty ? senderIP : pkt.ip
+            let roomId = pkt.roomId.isEmpty ? pkt.deviceId : pkt.roomId
+            let roomName = pkt.roomName.isEmpty ? "\(pkt.deviceName)的房间" : pkt.roomName
+
+            // If we joined this host's room and the host renamed itself, mirror the updated room name
+            if roomId == currentRoomId && pkt.deviceId == roomId && !roomName.isEmpty && currentRoomName != roomName {
+                currentRoomName = roomName
             }
 
-            guard !currentRoomCode.isEmpty && pkt.roomCode == currentRoomCode else { return }
-
-            let effectiveIP = !senderIP.isEmpty ? senderIP : pkt.ip
-            if let existing = peersById[pkt.deviceId] {
+            var isBrandNew = false
+            if let existing = allPeersById[pkt.deviceId] {
                 if pkt.ts < existing.lastPacketTs { return }
                 let mode: ConnectionMode = (source == .lan || existing.connectionMode == .lan) ? .lan : .relay
-                peersById[pkt.deviceId] = DeviceRecord(
+                allPeersById[pkt.deviceId] = DeviceRecord(
                     id: pkt.deviceId,
                     deviceName: pkt.deviceName,
                     platform: PlatformType(rawValue: pkt.platform) ?? .windows,
-                    roomCode: pkt.roomCode,
+                    roomId: roomId,
+                    roomName: roomName,
                     lanName: pkt.lanName,
                     ip: effectiveIP.isEmpty ? existing.ip : effectiveIP,
                     subnet: pkt.subnet,
@@ -556,11 +593,13 @@ final class SyncEngine: ObservableObject {
                     player: pkt.player
                 )
             } else {
-                peersById[pkt.deviceId] = DeviceRecord(
+                isBrandNew = true
+                allPeersById[pkt.deviceId] = DeviceRecord(
                     id: pkt.deviceId,
                     deviceName: pkt.deviceName,
                     platform: PlatformType(rawValue: pkt.platform) ?? .windows,
-                    roomCode: pkt.roomCode,
+                    roomId: roomId,
+                    roomName: roomName,
                     lanName: pkt.lanName,
                     ip: effectiveIP,
                     subnet: pkt.subnet,
@@ -570,50 +609,69 @@ final class SyncEngine: ObservableObject {
                     connectionMode: source,
                     player: pkt.player
                 )
-                // Immediately reply with our presence so newly joined peers see us instantly
+            }
+
+            rebuildDerivedLists()
+            if isBrandNew {
                 broadcastPresence(includeRelay: true)
             }
-            publishSortedPeers()
         } else if type == "leave", let pkt = try? JSONDecoder().decode(LeavePacket.self, from: data) {
             guard pkt.deviceId != deviceId else { return }
-            if let existing = peersById[pkt.deviceId], pkt.ts >= existing.lastPacketTs {
-                peersById.removeValue(forKey: pkt.deviceId)
-                publishSortedPeers()
+            if var existing = allPeersById[pkt.deviceId], pkt.ts >= existing.lastPacketTs, existing.roomId == pkt.roomId {
+                // Peer returned to its own room
+                existing.roomId = existing.id
+                existing.roomName = "\(existing.deviceName)的房间"
+                existing.lastPacketTs = pkt.ts
+                allPeersById[pkt.deviceId] = existing
+                rebuildDerivedLists()
             }
         } else if type == "command", let cmd = try? JSONDecoder().decode(CommandPacket.self, from: data) {
             guard !executedCmdIds.contains(cmd.cmdId) else { return }
             guard cmd.ts >= startupMs - 5000 else { return }
-            guard currentRoomCode.isEmpty || cmd.roomCode == currentRoomCode else { return }
+            guard cmd.roomId == currentRoomId else { return }
             executedCmdIds.insert(cmd.cmdId)
 
             if cmd.targetDeviceId == deviceId {
                 applyOptimisticLocal(action: cmd.action, position: cmd.position)
                 mediaController.execute(action: cmd.action, position: cmd.position)
-                broadcastPresence(includeRelay: !currentRoomCode.isEmpty)
+                broadcastPresence(includeRelay: true)
             }
         }
     }
 
     private func pruneStalePeers() {
         let now = nowMillis()
-        let beforePeers = peersById.count
-        peersById = peersById.filter { now - $0.value.lastSeen < 14_000 }
-        if peersById.count != beforePeers {
-            publishSortedPeers()
-        }
-
-        let beforeRooms = discoveredRoomsMap.count
-        discoveredRoomsMap = discoveredRoomsMap.filter { now - $0.value < 15_000 }
-        if discoveredRoomsMap.count != beforeRooms {
-            publishDiscoveredRooms()
+        let before = allPeersById.count
+        allPeersById = allPeersById.filter { now - $0.value.lastSeen < 14_000 }
+        if allPeersById.count != before {
+            rebuildDerivedLists()
         }
     }
 
-    private func publishSortedPeers() {
-        roomPeers = peersById.values.sorted { $0.deviceName.localizedCompare($1.deviceName) == .orderedAscending }
-    }
+    private func rebuildDerivedLists() {
+        // 1. Peers inside our current room
+        roomPeers = allPeersById.values
+            .filter { $0.roomId == currentRoomId }
+            .sorted { $0.deviceName.localizedCompare($1.deviceName) == .orderedAscending }
 
-    private func publishDiscoveredRooms() {
-        discoveredRooms = discoveredRoomsMap.keys.sorted()
+        // 2. Other active rooms available to join directly (one click, no code!)
+        var grouped: [String: [DeviceRecord]] = [:]
+        for peer in allPeersById.values where peer.roomId != currentRoomId {
+            grouped[peer.roomId, default: []].append(peer)
+        }
+
+        var rooms: [AvailableRoom] = []
+        for (rId, members) in grouped {
+            let host = members.first(where: { $0.id == rId }) ?? members[0]
+            let isLan = members.contains(where: { $0.connectionMode == .lan })
+            rooms.append(AvailableRoom(
+                id: rId,
+                roomName: host.roomName.isEmpty ? "\(host.deviceName)的房间" : host.roomName,
+                hostPlatform: host.platform,
+                memberCount: members.count,
+                isLanDirect: isLan
+            ))
+        }
+        availableRooms = rooms.sorted { $0.roomName.localizedCompare($1.roomName) == .orderedAscending }
     }
 }

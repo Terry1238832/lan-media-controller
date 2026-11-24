@@ -88,7 +88,7 @@
 
                 <StackPanel Grid.Column="1" VerticalAlignment="Center">
                     <TextBlock Text="四端局域网媒体控制器" FontSize="16" FontWeight="Bold" Foreground="#F8FAFC"/>
-                    <TextBlock Text="Native Windows · 实时媒体同步" FontSize="11" Foreground="#94A3B8" Margin="0,2,0,0"/>
+                    <TextBlock Text="Native Windows · 启动自动开房" FontSize="11" Foreground="#94A3B8" Margin="0,2,0,0"/>
                 </StackPanel>
 
                 <Border Grid.Column="2" Background="#162036" BorderBrush="#24334F" BorderThickness="1"
@@ -101,11 +101,11 @@
                 </Border>
             </Grid>
 
-            <!-- Identity & Room Card -->
+            <!-- Identity & Auto-Host Room Card -->
             <Border Background="#162036" BorderBrush="#24334F" BorderThickness="1" CornerRadius="16" Padding="16" Margin="0,0,0,14">
                 <StackPanel>
                     <Grid Margin="0,0,0,8">
-                        <TextBlock Text="本机设备信息" FontSize="12" FontWeight="SemiBold" Foreground="#94A3B8" VerticalAlignment="Center"/>
+                        <TextBlock Text="本机设备名称" FontSize="12" FontWeight="SemiBold" Foreground="#94A3B8" VerticalAlignment="Center"/>
                         <Border Background="#1E3A5F" CornerRadius="7" Padding="9,3" HorizontalAlignment="Right">
                             <TextBlock Text="Windows" FontSize="11" FontWeight="Bold" Foreground="#60A5FA"/>
                         </Border>
@@ -123,53 +123,41 @@
 
                     <Border Height="1" Background="#24334F" Margin="0,0,0,14"/>
 
-                    <!-- Lobby Panel -->
-                    <StackPanel x:Name="LobbyPanel">
-                        <Button Content="+ 独立开房间（生成 4 位匹配码）" Style="{StaticResource DarkButtonStyle}"
-                                Background="#10B981" FontSize="14" FontWeight="Bold" Padding="12,10"
-                                Margin="0,0,0,10" Click="CreateRoomBtn_Click"/>
-
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="125"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBox x:Name="JoinCodeBox" Style="{StaticResource DarkTextBoxStyle}"
-                                     MaxLength="4" TextAlignment="Center" FontFamily="Consolas" FontWeight="Bold"
-                                     FontSize="16" Margin="0,0,8,0" KeyDown="JoinCodeBox_KeyDown"/>
-                            <Button Grid.Column="1" Content="加入房间" Style="{StaticResource DarkButtonStyle}"
-                                    Background="#3B82F6" FontSize="14" Click="JoinRoomBtn_Click"/>
-                        </Grid>
-
-                        <WrapPanel x:Name="DiscoveredRoomsPanel" Margin="0,10,0,0" Visibility="Collapsed"/>
-                    </StackPanel>
-
-                    <!-- Active Room Panel -->
-                    <Grid x:Name="ActiveRoomPanel" Visibility="Collapsed">
+                    <!-- Current Room Bar -->
+                    <Grid Margin="0,0,0,14">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
                         <StackPanel>
-                            <TextBlock Text="当前房间匹配码" FontSize="12" Foreground="#94A3B8"/>
-                            <StackPanel Orientation="Horizontal" Margin="0,2,0,0" VerticalAlignment="Center">
-                                <TextBlock x:Name="RoomCodeText" Text="----" FontFamily="Consolas" FontSize="26"
-                                           FontWeight="ExtraBold" Foreground="#60A5FA" VerticalAlignment="Center"/>
-                                <Button x:Name="CopyCodeBtn" Content="复制" Style="{StaticResource DarkButtonStyle}"
-                                        Background="#26344E" FontSize="11" Padding="9,4" Margin="10,0,0,0"
-                                        VerticalAlignment="Center" Click="CopyCodeBtn_Click"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                <TextBlock Text="当前所在房间" FontSize="11" Foreground="#94A3B8" VerticalAlignment="Center"/>
+                                <Border x:Name="RoomRoleBadge" Background="#143C33" CornerRadius="6" Padding="7,2" Margin="8,0,0,0">
+                                    <TextBlock x:Name="RoomRoleText" Text="默认已开房" FontSize="10" FontWeight="Bold" Foreground="#34D399"/>
+                                </Border>
                             </StackPanel>
+                            <TextBlock x:Name="CurrentRoomNameText" Text="我的房间" FontSize="18" FontWeight="Bold"
+                                       Foreground="#F8FAFC" TextTrimming="CharacterEllipsis"/>
                         </StackPanel>
-                        <Button Grid.Column="1" Content="退出房间" Style="{StaticResource DarkButtonStyle}"
-                                Background="#DC2626" Padding="14,9" VerticalAlignment="Center" Click="LeaveRoomBtn_Click"/>
+                        <Button x:Name="ReturnOwnRoomBtn" Grid.Column="1" Content="回到我的房间"
+                                Style="{StaticResource DarkButtonStyle}" Background="#DC2626"
+                                FontSize="12" Padding="12,8" VerticalAlignment="Center"
+                                Visibility="Collapsed" Click="ReturnOwnRoomBtn_Click"/>
                     </Grid>
+
+                    <!-- Discoverable Other Rooms (One-Click Join, No Code!) -->
+                    <TextBlock Text="可加入的其他设备房间" FontSize="12" FontWeight="SemiBold" Foreground="#94A3B8" Margin="0,0,0,8"/>
+                    <TextBlock x:Name="EmptyRoomsHint"
+                               Text="正在自动发现其他设备房间，对方打开软件后可直接点击加入..."
+                               FontSize="12" Foreground="#64748B" Margin="0,2,0,4" TextWrapping="Wrap"/>
+                    <StackPanel x:Name="AvailableRoomsPanel"/>
                 </StackPanel>
             </Border>
 
             <!-- Section Header -->
             <Grid Margin="4,0,4,10">
-                <TextBlock x:Name="SectionTitleText" Text="本机媒体播放器" FontSize="13" FontWeight="SemiBold" Foreground="#94A3B8"/>
-                <TextBlock x:Name="DeviceCountText" Text="未加入房间" FontSize="12" Foreground="#64748B" HorizontalAlignment="Right"/>
+                <TextBlock Text="房间内设备播放器" FontSize="13" FontWeight="SemiBold" Foreground="#94A3B8"/>
+                <TextBlock x:Name="DeviceCountText" Text="共 1 台设备在线" FontSize="12" Foreground="#64748B" HorizontalAlignment="Right"/>
             </Grid>
 
             <!-- Reusable Player Cards Container -->

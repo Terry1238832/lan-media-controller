@@ -19,7 +19,7 @@ enum PlatformType: String, Codable, CaseIterable {
 enum ConnectionMode: String {
     case local = "本机"
     case lan = "局域网直连"
-    case relay = "中继同步"
+    case relay = "网络同步"
 }
 
 struct PlayerState: Codable, Equatable {
@@ -62,7 +62,8 @@ struct DeviceRecord: Identifiable, Equatable {
     var id: String
     var deviceName: String
     var platform: PlatformType
-    var roomCode: String
+    var roomId: String
+    var roomName: String
     var lanName: String
     var ip: String
     var subnet: String
@@ -73,13 +74,22 @@ struct DeviceRecord: Identifiable, Equatable {
     var player: PlayerState
 }
 
+struct AvailableRoom: Identifiable, Equatable {
+    var id: String          // roomId
+    var roomName: String
+    var hostPlatform: PlatformType
+    var memberCount: Int
+    var isLanDirect: Bool
+}
+
 struct PresencePacket: Codable {
     var v: Int = 2
     var type: String = "presence"
     var deviceId: String
     var deviceName: String
     var platform: String
-    var roomCode: String
+    var roomId: String
+    var roomName: String
     var lanName: String
     var ip: String
     var subnet: String
@@ -92,7 +102,7 @@ struct LeavePacket: Codable {
     var v: Int = 2
     var type: String = "leave"
     var deviceId: String
-    var roomCode: String
+    var roomId: String
     var ts: Int64
 }
 
@@ -100,7 +110,7 @@ struct CommandPacket: Codable {
     var v: Int = 2
     var type: String = "command"
     var cmdId: String
-    var roomCode: String
+    var roomId: String
     var targetDeviceId: String
     var action: String
     var position: Double

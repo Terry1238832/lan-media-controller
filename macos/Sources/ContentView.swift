@@ -4,8 +4,6 @@ import AppKit
 struct ContentView: View {
     @ObservedObject var engine: SyncEngine
     @State private var nameInput: String = ""
-    @State private var joinCodeInput: String = ""
-    @State private var copiedRoom = false
 
     private let bgColor = Color(red: 0.043, green: 0.067, blue: 0.125)
     private let cardBg = Color(red: 0.086, green: 0.125, blue: 0.212)
@@ -44,7 +42,7 @@ struct ContentView: View {
                 Text("四端局域网媒体控制器")
                     .font(.system(size: 16, weight: .bold))
                     .foregroundColor(.white)
-                Text("Native macOS · 实时媒体同步")
+                Text("Native macOS · 启动自动开房")
                     .font(.system(size: 11))
                     .foregroundColor(Color.white.opacity(0.55))
             }
@@ -75,7 +73,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("本机设备信息")
+                    Text("本机设备名称")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(Color.white.opacity(0.6))
                     Spacer()
@@ -109,116 +107,91 @@ struct ContentView: View {
 
             Divider().background(borderColor)
 
-            if engine.currentRoomCode.isEmpty {
-                VStack(spacing: 10) {
-                    Button(action: { engine.createRoom() }) {
-                        HStack {
-                            Image(systemName: "plus.circle.fill")
-                            Text("独立开房间（生成 4 位匹配码）")
-                        }
-                        .font(.system(size: 14, weight: .bold))
+            // Current Room Banner (always active!)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text("当前所在房间")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(Color.white.opacity(0.55))
+                        Text(engine.isHostingOwnRoom ? "默认已开房" : "已加入对方房间")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(engine.isHostingOwnRoom ? Color.green : Color(red: 0.38, green: 0.65, blue: 0.98))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background((engine.isHostingOwnRoom ? Color.green : Color.blue).opacity(0.18))
+                            .cornerRadius(6)
+                    }
+                    Text(engine.currentRoomName)
+                        .font(.system(size: 18, weight: .bold))
                         .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(Color(red: 0.06, green: 0.72, blue: 0.5))
-                        .cornerRadius(10)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                if !engine.isHostingOwnRoom {
+                    Button(action: { engine.returnToOwnRoom() }) {
+                        Text("回到我的房间")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.red.opacity(0.85))
+                            .cornerRadius(9)
                     }
                     .buttonStyle(.plain)
+                }
+            }
 
+            // Nearby Discoverable Rooms (One-Click Join, No Code!)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("可加入的其他设备房间")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.white.opacity(0.6))
+
+                if engine.availableRooms.isEmpty {
                     HStack(spacing: 8) {
-                        TextField("输入4位码", text: $joinCodeInput)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 15, weight: .bold, design: .monospaced))
-                            .multilineTextAlignment(.center)
-                            .foregroundColor(.white)
-                            .frame(width: 120)
-                            .padding(.vertical, 9)
-                            .background(Color.black.opacity(0.32))
-                            .cornerRadius(10)
-                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(borderColor, lineWidth: 1))
-                            .onChange(of: joinCodeInput) { val in
-                                let filtered = String(val.filter { $0.isNumber }.prefix(4))
-                                if filtered != val { joinCodeInput = filtered }
-                            }
-                            .onSubmit {
-                                engine.joinRoom(code: joinCodeInput)
-                                joinCodeInput = ""
-                            }
-
-                        Button(action: {
-                            engine.joinRoom(code: joinCodeInput)
-                            joinCodeInput = ""
-                        }) {
-                            Text("加入房间")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 9)
-                                .background(Color.blue)
-                                .cornerRadius(10)
-                        }
-                        .buttonStyle(.plain)
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .font(.system(size: 12))
+                            .foregroundColor(Color.white.opacity(0.4))
+                        Text("正在自动发现其他设备房间，对方打开软件后可直接点击加入")
+                            .font(.system(size: 12))
+                            .foregroundColor(Color.white.opacity(0.45))
                     }
-
-                    if !engine.discoveredRooms.isEmpty {
-                        HStack(spacing: 6) {
-                            Text("局域网房间：")
-                                .font(.system(size: 12))
-                                .foregroundColor(Color.white.opacity(0.55))
-                            ForEach(engine.discoveredRooms, id: \.self) { code in
-                                Button(action: { engine.joinRoom(code: code) }) {
-                                    Text("#\(code)")
-                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                        .foregroundColor(Color(red: 0.38, green: 0.65, blue: 0.98))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 4)
-                                        .background(Color.blue.opacity(0.18))
-                                        .cornerRadius(999)
+                    .padding(.vertical, 6)
+                } else {
+                    VStack(spacing: 8) {
+                        ForEach(engine.availableRooms) { room in
+                            HStack(spacing: 10) {
+                                PlatformBadge(platform: room.hostPlatform)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(room.roomName)
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .foregroundColor(.white)
+                                        .lineLimit(1)
+                                    Text("\(room.memberCount) 台设备 · \(room.isLanDirect ? "局域网直连" : "网络发现")")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(Color.white.opacity(0.5))
+                                }
+                                Spacer()
+                                Button(action: { engine.joinRoom(room) }) {
+                                    Text("加入")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 7)
+                                        .background(Color.blue)
+                                        .cornerRadius(9)
                                 }
                                 .buttonStyle(.plain)
                             }
-                            Spacer()
+                            .padding(10)
+                            .background(Color.black.opacity(0.24))
+                            .cornerRadius(11)
+                            .overlay(RoundedRectangle(cornerRadius: 11).stroke(borderColor, lineWidth: 1))
                         }
                     }
-                }
-            } else {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("当前房间匹配码")
-                            .font(.system(size: 12))
-                            .foregroundColor(Color.white.opacity(0.6))
-                        HStack(spacing: 8) {
-                            Text(engine.currentRoomCode)
-                                .font(.system(size: 26, weight: .heavy, design: .monospaced))
-                                .foregroundColor(Color(red: 0.38, green: 0.65, blue: 0.98))
-                            Button(action: {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(engine.currentRoomCode, forType: .string)
-                                copiedRoom = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedRoom = false }
-                            }) {
-                                Text(copiedRoom ? "已复制" : "复制")
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundColor(.white.opacity(0.85))
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(Color.white.opacity(0.1))
-                                    .cornerRadius(6)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    Spacer()
-                    Button(action: { engine.leaveRoom() }) {
-                        Text("退出房间")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 9)
-                            .background(Color.red.opacity(0.85))
-                            .cornerRadius(10)
-                    }
-                    .buttonStyle(.plain)
                 }
             }
         }
@@ -231,12 +204,11 @@ struct ContentView: View {
     private var playersSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(engine.currentRoomCode.isEmpty ? "本机媒体播放器" : "房间内设备播放器")
+                Text("房间内设备播放器")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(Color.white.opacity(0.65))
                 Spacer()
-                let totalCount = 1 + engine.roomPeers.count
-                Text(engine.currentRoomCode.isEmpty ? "未加入房间" : "共 \(totalCount) 台设备在线")
+                Text("共 \(1 + engine.roomPeers.count) 台设备在线")
                     .font(.system(size: 12))
                     .foregroundColor(Color.white.opacity(0.5))
             }

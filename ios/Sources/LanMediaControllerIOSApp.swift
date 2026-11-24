@@ -1,9 +1,8 @@
 import SwiftUI
 import MediaPlayer
-import Network
-import Darwin
+import CryptoKit
 
-// iOS SwiftUI client implementing the exact same LMC v2 protocol as macOS, Windows, and Android.
+// iOS SwiftUI client implementing the exact same LMC v2.1 auto-host room protocol as macOS, Windows, and Android.
 // Open in Xcode (iOS 16+ SwiftUI App target) to build & deploy to iPhone/iPad.
 
 struct IOSPlayerState: Codable, Equatable {
@@ -36,7 +35,8 @@ struct IOSDeviceRecord: Identifiable {
     var id: String
     var deviceName: String
     var platform: String
-    var roomCode: String
+    var roomId: String
+    var roomName: String
     var ip: String
     var httpPort: Int
     var lastSeen: Int64
@@ -45,49 +45,63 @@ struct IOSDeviceRecord: Identifiable {
     var player: IOSPlayerState
 }
 
+struct IOSAvailableRoom: Identifiable {
+    var id: String
+    var roomName: String
+    var hostPlatform: String
+    var memberCount: Int
+}
+
 @MainActor
 final class IOSSyncEngine: ObservableObject {
-    static let udpPort: UInt16 = 41234
-    static let multicastGroup = "239.255.42.99"
     static let relayBase = "https://ntfy.sh"
 
     @Published var deviceName: String
-    @Published var currentRoomCode: String = ""
+    @Published var currentRoomId: String
+    @Published var currentRoomName: String
     @Published var displayedLanName: String = "局域网"
     @Published var localPlayer = IOSPlayerState()
     @Published var roomPeers: [IOSDeviceRecord] = []
+    @Published var availableRooms: [IOSAvailableRoom] = []
     @Published var uiTick: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
 
     let deviceId: String
-    private var peersById: [String: IOSDeviceRecord] = [:]
+    var isHostingOwnRoom: Bool { currentRoomId == deviceId }
+
+    private var allPeersById: [String: IOSDeviceRecord] = [:]
     private var executedCmdIds: Set<String> = []
+    private var homeRelayTopic: String = ""
     private var relayTask: Task<Void, Never>?
     private var timer: Timer?
     private let startupMs = Int64(Date().timeIntervalSince1970 * 1000)
 
     init() {
         let d = UserDefaults.standard
+        let resolvedId: String
         if let saved = d.string(forKey: "lmc_v2_ios_id"), !saved.isEmpty {
-            deviceId = saved
+            resolvedId = saved
         } else {
             let id = "ios-" + UUID().uuidString.prefix(8).lowercased()
             d.set(id, forKey: "lmc_v2_ios_id")
-            deviceId = id
+            resolvedId = id
         }
-        deviceName = d.string(forKey: "lmc_v2_ios_name") ?? UIDevice.current.name
+        let resolvedName = d.string(forKey: "lmc_v2_ios_name") ?? UIDevice.current.name
+        deviceId = resolvedId
+        deviceName = resolvedName
+        currentRoomId = resolvedId
+        currentRoomName = "\(resolvedName)的房间"
     }
 
     func start() {
         refreshSystemMusic()
+        resolveHomeRelayAndConnect()
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.uiTick = Int64(Date().timeIntervalSince1970 * 1000)
                 self.refreshSystemMusic()
-                if !self.currentRoomCode.isEmpty {
-                    self.publishPresence()
-                }
+                self.publishPresence()
                 self.prunePeers()
             }
         }
@@ -97,34 +111,31 @@ final class IOSSyncEngine: ObservableObject {
         let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         deviceName = t
+        if currentRoomId == deviceId {
+            currentRoomName = "\(t)的房间"
+        }
         UserDefaults.standard.set(t, forKey: "lmc_v2_ios_name")
-        if !currentRoomCode.isEmpty { publishPresence() }
-    }
-
-    func createRoom() {
-        joinRoom(code: String(format: "%04d", Int.random(in: 1000...9999)))
-    }
-
-    func joinRoom(code: String) {
-        let clean = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard clean.count == 4, clean.allSatisfy({ $0.isNumber }) else { return }
-        currentRoomCode = clean
-        peersById.removeAll()
-        roomPeers = []
-        startRelay(roomCode: clean)
         publishPresence()
     }
 
-    func leaveRoom() {
-        let old = currentRoomCode
-        currentRoomCode = ""
-        relayTask?.cancel()
-        peersById.removeAll()
-        roomPeers = []
-        if !old.isEmpty {
-            let payload: [String: Any] = ["v": 2, "type": "leave", "deviceId": deviceId, "roomCode": old, "ts": Int64(Date().timeIntervalSince1970 * 1000)]
-            postRelay(roomCode: old, obj: payload)
-        }
+    func joinRoom(_ room: IOSAvailableRoom) {
+        guard room.id != currentRoomId else { return }
+        let old = currentRoomId
+        postLeave(roomId: old)
+        currentRoomId = room.id
+        currentRoomName = room.roomName
+        rebuildLists()
+        publishPresence()
+    }
+
+    func returnToOwnRoom() {
+        guard currentRoomId != deviceId else { return }
+        let old = currentRoomId
+        postLeave(roomId: old)
+        currentRoomId = deviceId
+        currentRoomName = "\(deviceName)的房间"
+        rebuildLists()
+        publishPresence()
     }
 
     func sendCommand(to targetId: String, action: String, position: Double = 0) {
@@ -132,15 +143,14 @@ final class IOSSyncEngine: ObservableObject {
             executeLocalMusicCommand(action: action, position: position)
             return
         }
-        guard !currentRoomCode.isEmpty else { return }
         let cmdId = "cmd-\(UUID().uuidString.prefix(8).lowercased())"
         executedCmdIds.insert(cmdId)
         let cmd: [String: Any] = [
-            "v": 2, "type": "command", "cmdId": cmdId, "roomCode": currentRoomCode,
+            "v": 2, "type": "command", "cmdId": cmdId, "roomId": currentRoomId,
             "targetDeviceId": targetId, "action": action, "position": position,
             "ts": Int64(Date().timeIntervalSince1970 * 1000)
         ]
-        if let peer = peersById[targetId], !peer.ip.isEmpty, peer.httpPort > 0,
+        if let peer = allPeersById[targetId], !peer.ip.isEmpty, peer.httpPort > 0,
            let url = URL(string: "http://\(peer.ip):\(peer.httpPort)/api/command"),
            let data = try? JSONSerialization.data(withJSONObject: cmd) {
             var req = URLRequest(url: url)
@@ -149,7 +159,7 @@ final class IOSSyncEngine: ObservableObject {
             req.httpBody = data
             URLSession.shared.dataTask(with: req).resume()
         }
-        postRelay(roomCode: currentRoomCode, obj: cmd)
+        postRelay(obj: cmd)
     }
 
     private func refreshSystemMusic() {
@@ -186,28 +196,58 @@ final class IOSSyncEngine: ObservableObject {
         default: break
         }
         refreshSystemMusic()
-        if !currentRoomCode.isEmpty { publishPresence() }
+        publishPresence()
+    }
+
+    private func resolveHomeRelayAndConnect() {
+        Task { [weak self] in
+            let endpoints = ["https://api4.ipify.org", "https://ipv4.icanhazip.com"]
+            var publicIP = ""
+            for ep in endpoints {
+                guard let url = URL(string: ep) else { continue }
+                if let (data, _) = try? await URLSession.shared.data(from: url),
+                   let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   str.split(separator: ".").count == 4 {
+                    publicIP = str
+                    break
+                }
+            }
+            guard !publicIP.isEmpty else { return }
+            let digest = SHA256.hash(data: Data("lmc-v2-home:\(publicIP)".utf8))
+            let hex = digest.map { String(format: "%02x", $0) }.joined()
+            let topic = "lmc_v2_home_\(hex.prefix(16))"
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.homeRelayTopic = topic
+                self.startRelay(topic: topic)
+                self.publishPresence()
+            }
+        }
     }
 
     private func publishPresence() {
-        guard !currentRoomCode.isEmpty else { return }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let obj: [String: Any] = [
             "v": 2, "type": "presence", "deviceId": deviceId, "deviceName": deviceName,
-            "platform": "ios", "roomCode": currentRoomCode, "lanName": "",
-            "ip": "", "subnet": "", "httpPort": 0, "ts": now,
+            "platform": "ios", "roomId": currentRoomId, "roomName": currentRoomName,
+            "lanName": "", "ip": "", "subnet": "", "httpPort": 0, "ts": now,
             "player": [
                 "appName": localPlayer.appName, "title": localPlayer.title, "artist": localPlayer.artist,
                 "isPlaying": localPlayer.isPlaying, "position": localPlayer.position,
                 "duration": localPlayer.duration, "hasMedia": localPlayer.hasMedia, "updatedAt": localPlayer.updatedAt
             ]
         ]
-        postRelay(roomCode: currentRoomCode, obj: obj)
+        postRelay(obj: obj)
     }
 
-    private func startRelay(roomCode: String) {
+    private func postLeave(roomId: String) {
+        let obj: [String: Any] = ["v": 2, "type": "leave", "deviceId": deviceId, "roomId": roomId, "ts": Int64(Date().timeIntervalSince1970 * 1000)]
+        postRelay(obj: obj)
+    }
+
+    private func startRelay(topic: String) {
         relayTask?.cancel()
-        guard let url = URL(string: "\(IOSSyncEngine.relayBase)/lmc_v2_r_\(roomCode)/sse?since=2m") else { return }
+        guard let url = URL(string: "\(IOSSyncEngine.relayBase)/\(topic)/sse?since=1m") else { return }
         relayTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
@@ -230,8 +270,9 @@ final class IOSSyncEngine: ObservableObject {
         }
     }
 
-    private func postRelay(roomCode: String, obj: [String: Any]) {
-        guard let url = URL(string: "\(IOSSyncEngine.relayBase)/lmc_v2_r_\(roomCode)"),
+    private func postRelay(obj: [String: Any]) {
+        guard !homeRelayTopic.isEmpty,
+              let url = URL(string: "\(IOSSyncEngine.relayBase)/\(homeRelayTopic)"),
               let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -246,10 +287,13 @@ final class IOSSyncEngine: ObservableObject {
         if type == "presence" {
             let devId = (obj["deviceId"] as? String) ?? ""
             guard !devId.isEmpty && devId != deviceId else { return }
-            let room = (obj["roomCode"] as? String) ?? ""
-            guard room == currentRoomCode else { return }
+            let devName = (obj["deviceName"] as? String) ?? "设备"
+            let roomId = ((obj["roomId"] as? String) ?? "").isEmpty ? devId : (obj["roomId"] as! String)
+            let roomName = ((obj["roomName"] as? String) ?? "").isEmpty ? "\(devName)的房间" : (obj["roomName"] as! String)
             let ts = (obj["ts"] as? NSNumber)?.int64Value ?? now
-            if let existing = peersById[devId], ts < existing.lastPacketTs { return }
+            if let existing = allPeersById[devId], ts < existing.lastPacketTs { return }
+            if roomId == currentRoomId && devId == roomId { currentRoomName = roomName }
+
             let pObj = obj["player"] as? [String: Any]
             let player = IOSPlayerState(
                 appName: (pObj?["appName"] as? String) ?? "",
@@ -261,28 +305,34 @@ final class IOSSyncEngine: ObservableObject {
                 hasMedia: (pObj?["hasMedia"] as? Bool) ?? false,
                 updatedAt: (pObj?["updatedAt"] as? NSNumber)?.int64Value ?? now
             )
-            peersById[devId] = IOSDeviceRecord(
+            let isNew = allPeersById[devId] == nil
+            allPeersById[devId] = IOSDeviceRecord(
                 id: devId,
-                deviceName: (obj["deviceName"] as? String) ?? "设备",
+                deviceName: devName,
                 platform: (obj["platform"] as? String) ?? "windows",
-                roomCode: room,
+                roomId: roomId,
+                roomName: roomName,
                 ip: (obj["ip"] as? String) ?? "",
                 httpPort: (obj["httpPort"] as? Int) ?? 41235,
                 lastSeen: now,
                 lastPacketTs: ts,
-                connectionMode: "同步中",
+                connectionMode: "网络同步",
                 player: player
             )
-            roomPeers = peersById.values.sorted { $0.deviceName < $1.deviceName }
+            rebuildLists()
+            if isNew { publishPresence() }
         } else if type == "leave" {
-            if let devId = obj["deviceId"] as? String {
-                peersById.removeValue(forKey: devId)
-                roomPeers = peersById.values.sorted { $0.deviceName < $1.deviceName }
+            if let devId = obj["deviceId"] as? String, var existing = allPeersById[devId] {
+                existing.roomId = existing.id
+                existing.roomName = "\(existing.deviceName)的房间"
+                allPeersById[devId] = existing
+                rebuildLists()
             }
         } else if type == "command" {
             let cmdId = (obj["cmdId"] as? String) ?? ""
             let ts = (obj["ts"] as? NSNumber)?.int64Value ?? 0
-            guard !cmdId.isEmpty, !executedCmdIds.contains(cmdId), ts >= startupMs - 5000 else { return }
+            let roomId = (obj["roomId"] as? String) ?? ""
+            guard !cmdId.isEmpty, !executedCmdIds.contains(cmdId), ts >= startupMs - 5000, roomId == currentRoomId else { return }
             executedCmdIds.insert(cmdId)
             if (obj["targetDeviceId"] as? String) == deviceId {
                 executeLocalMusicCommand(
@@ -295,8 +345,20 @@ final class IOSSyncEngine: ObservableObject {
 
     private func prunePeers() {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        peersById = peersById.filter { now - $0.value.lastSeen < 14_000 }
-        roomPeers = peersById.values.sorted { $0.deviceName < $1.deviceName }
+        allPeersById = allPeersById.filter { now - $0.value.lastSeen < 14_000 }
+        rebuildLists()
+    }
+
+    private func rebuildLists() {
+        roomPeers = allPeersById.values.filter { $0.roomId == currentRoomId }.sorted { $0.deviceName < $1.deviceName }
+        var grouped: [String: [IOSDeviceRecord]] = [:]
+        for p in allPeersById.values where p.roomId != currentRoomId {
+            grouped[p.roomId, default: []].append(p)
+        }
+        availableRooms = grouped.map { (rId, members) in
+            let host = members.first(where: { $0.id == rId }) ?? members[0]
+            return IOSAvailableRoom(id: rId, roomName: host.roomName, hostPlatform: host.platform, memberCount: members.count)
+        }.sorted { $0.roomName < $1.roomName }
     }
 }
 
@@ -315,7 +377,6 @@ struct LanMediaControllerIOSApp: App {
 struct IOSContentView: View {
     @ObservedObject var engine: IOSSyncEngine
     @State private var nameInput = ""
-    @State private var joinCode = ""
 
     var body: some View {
         ScrollView {
@@ -330,29 +391,33 @@ struct IOSContentView: View {
                         .background(Color.white.opacity(0.1)).clipShape(Capsule())
                 }
 
-                VStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         TextField("设备名称", text: $nameInput)
                             .textFieldStyle(.roundedBorder)
                         Button("保存") { engine.saveDeviceName(nameInput) }
                             .buttonStyle(.borderedProminent)
                     }
-                    if engine.currentRoomCode.isEmpty {
-                        Button("+ 独立开房间 (生成4位码)") { engine.createRoom() }
-                            .buttonStyle(.borderedProminent).tint(.green)
-                        HStack {
-                            TextField("4位码", text: $joinCode)
-                                .keyboardType(.numberPad).textFieldStyle(.roundedBorder)
-                            Button("加入房间") { engine.joinRoom(code: joinCode); joinCode = "" }
-                                .buttonStyle(.borderedProminent)
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text(engine.isHostingOwnRoom ? "当前房间（默认已开房）" : "当前已加入房间")
+                                .font(.caption).foregroundColor(.white.opacity(0.6))
+                            Text(engine.currentRoomName).font(.title3).bold().foregroundColor(.white)
                         }
-                    } else {
-                        HStack {
-                            Text("房间码：\(engine.currentRoomCode)")
-                                .font(.title2).bold().monospaced().foregroundColor(.blue)
-                            Spacer()
-                            Button("退出房间") { engine.leaveRoom() }
+                        Spacer()
+                        if !engine.isHostingOwnRoom {
+                            Button("回到我的房间") { engine.returnToOwnRoom() }
                                 .buttonStyle(.borderedProminent).tint(.red)
+                        }
+                    }
+                    if !engine.availableRooms.isEmpty {
+                        Text("可加入的其他设备房间").font(.caption).foregroundColor(.white.opacity(0.6))
+                        ForEach(engine.availableRooms) { room in
+                            HStack {
+                                Text(room.roomName).foregroundColor(.white).bold()
+                                Spacer()
+                                Button("加入") { engine.joinRoom(room) }.buttonStyle(.borderedProminent)
+                            }
                         }
                     }
                 }

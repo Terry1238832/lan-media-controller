@@ -1,9 +1,6 @@
 package com.local.lanmediacontroller
 
 import android.app.Activity
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -13,8 +10,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.text.InputFilter
-import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
@@ -36,12 +31,11 @@ class MainActivity : Activity() {
     private lateinit var lanNameText: TextView
     private lateinit var permissionBanner: LinearLayout
     private lateinit var deviceNameEdit: EditText
-    private lateinit var lobbyBox: LinearLayout
-    private lateinit var joinCodeEdit: EditText
-    private lateinit var discoveredRoomsRow: LinearLayout
-    private lateinit var activeRoomBox: LinearLayout
-    private lateinit var roomCodeText: TextView
-    private lateinit var sectionTitleText: TextView
+    private lateinit var roomRoleBadge: TextView
+    private lateinit var currentRoomNameText: TextView
+    private lateinit var returnOwnRoomBtn: Button
+    private lateinit var emptyRoomsHint: TextView
+    private lateinit var availableRoomsContainer: LinearLayout
     private lateinit var deviceCountText: TextView
     private lateinit var playersContainer: LinearLayout
 
@@ -65,6 +59,14 @@ class MainActivity : Activity() {
             cornerRadius = dp(radiusDp).toFloat()
             if (strokeHex != null) setStroke(dp(strokeDp), Color.parseColor(strokeHex))
         }
+    }
+
+    private fun platformColors(platform: String): Pair<String, String> = when (platform.lowercase()) {
+        "windows" -> "#1E3A5F" to "#60A5FA"
+        "macos" -> "#332152" to "#C084FC"
+        "ios" -> "#4C1D3D" to "#F472B6"
+        "android" -> "#143C33" to "#34D399"
+        else -> "#1E293B" to "#CBD5E1"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -126,7 +128,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#F8FAFC"))
         })
         titleCol.addView(TextView(this).apply {
-            text = "Native Android · 实时媒体同步"
+            text = "Native Android · 启动自动开房"
             textSize = 11f
             setTextColor(Color.parseColor("#94A3B8"))
         })
@@ -145,7 +147,7 @@ class MainActivity : Activity() {
         header.addView(lanNameText)
         root.addView(header)
 
-        // Notification Listener Permission Banner (shown only if not yet enabled)
+        // Notification Listener Permission Banner
         permissionBanner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -173,7 +175,7 @@ class MainActivity : Activity() {
         }
         root.addView(permissionBanner)
 
-        // Identity & Room Panel
+        // Identity & Auto-Host Room Panel
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(14), dp(14), dp(14))
@@ -190,7 +192,7 @@ class MainActivity : Activity() {
                 bottomMargin = dp(8)
             }
             addView(TextView(context).apply {
-                text = "本机设备信息"
+                text = "本机设备名称"
                 textSize = 12f
                 setTextColor(Color.parseColor("#94A3B8"))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -233,113 +235,98 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
             setOnClickListener {
                 SyncEngine.saveDeviceName(deviceNameEdit.text.toString())
-                Toast.makeText(this@MainActivity, "设备名称已保存", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "设备名称与房间名已更新", Toast.LENGTH_SHORT).show()
             }
         }
         nameRow.addView(deviceNameEdit)
         nameRow.addView(saveBtn)
         panel.addView(nameRow)
 
-        // Lobby Box
-        lobbyBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val createBtn = Button(this).apply {
-            text = "+ 独立开房间（生成 4 位匹配码）"
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            background = roundedBg("#10B981", 10)
+        // Divider
+        panel.addView(View(this).apply {
+            setBackgroundColor(Color.parseColor("#24334F"))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+                bottomMargin = dp(12)
+            }
+        })
+
+        // Current Room Banner
+        val curRoomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(10)
-            }
-            setOnClickListener { SyncEngine.createRoom() }
-        }
-        lobbyBox.addView(createBtn)
-
-        val joinRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        joinCodeEdit = EditText(this).apply {
-            hint = "4位码"
-            setHintTextColor(Color.parseColor("#64748B"))
-            setTextColor(Color.parseColor("#F8FAFC"))
-            textSize = 16f
-            typeface = Typeface.MONOSPACE
-            gravity = Gravity.CENTER
-            inputType = InputType.TYPE_CLASS_NUMBER
-            filters = arrayOf(InputFilter.LengthFilter(4))
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            background = roundedBg("#090E1A", 10, "#24334F")
-            layoutParams = LinearLayout.LayoutParams(dp(110), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                marginEnd = dp(8)
+                bottomMargin = dp(12)
             }
         }
-        val joinBtn = Button(this).apply {
-            text = "加入房间"
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            background = roundedBg("#3B82F6", 10)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                SyncEngine.joinRoom(joinCodeEdit.text.toString())
-                joinCodeEdit.setText("")
-            }
-        }
-        joinRow.addView(joinCodeEdit)
-        joinRow.addView(joinBtn)
-        lobbyBox.addView(joinRow)
-
-        discoveredRoomsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(10)
-            }
-        }
-        lobbyBox.addView(discoveredRoomsRow)
-        panel.addView(lobbyBox)
-
-        // Active Room Box
-        activeRoomBox = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-        }
-        val codeCol = LinearLayout(this).apply {
+        val curRoomCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        codeCol.addView(TextView(this).apply {
-            text = "当前房间匹配码"
-            textSize = 12f
+        val curLabelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        curLabelRow.addView(TextView(this).apply {
+            text = "当前所在房间"
+            textSize = 11f
             setTextColor(Color.parseColor("#94A3B8"))
         })
-        roomCodeText = TextView(this).apply {
-            text = "----"
-            textSize = 26f
-            typeface = Typeface.MONOSPACE
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor("#60A5FA"))
-            setOnClickListener {
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                cm?.setPrimaryClip(ClipData.newPlainText("roomCode", SyncEngine.currentRoomCode))
-                Toast.makeText(this@MainActivity, "已复制房间码", Toast.LENGTH_SHORT).show()
+        roomRoleBadge = TextView(this).apply {
+            text = "默认已开房"
+            textSize = 10f
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(7), dp(2), dp(7), dp(2))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(8)
             }
         }
-        codeCol.addView(roomCodeText)
-        val leaveBtn = Button(this).apply {
-            text = "退出房间"
-            textSize = 13f
-            setTextColor(Color.WHITE)
-            background = roundedBg("#DC2626", 10)
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-            setOnClickListener { SyncEngine.leaveRoom() }
+        curLabelRow.addView(roomRoleBadge)
+        curRoomCol.addView(curLabelRow)
+
+        currentRoomNameText = TextView(this).apply {
+            text = "我的房间"
+            textSize = 18f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#F8FAFC"))
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
         }
-        activeRoomBox.addView(codeCol)
-        activeRoomBox.addView(leaveBtn)
-        panel.addView(activeRoomBox)
+        curRoomCol.addView(currentRoomNameText)
+        curRoomRow.addView(curRoomCol)
+
+        returnOwnRoomBtn = Button(this).apply {
+            text = "回到我的房间"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = roundedBg("#DC2626", 9)
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            visibility = View.GONE
+            setOnClickListener { SyncEngine.returnToOwnRoom() }
+        }
+        curRoomRow.addView(returnOwnRoomBtn)
+        panel.addView(curRoomRow)
+
+        // Discoverable Other Rooms (One-Click Join)
+        panel.addView(TextView(this).apply {
+            text = "可加入的其他设备房间"
+            textSize = 12f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#94A3B8"))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(8)
+            }
+        })
+        emptyRoomsHint = TextView(this).apply {
+            text = "正在自动发现其他设备房间，对方打开软件后可直接点击加入..."
+            textSize = 12f
+            setTextColor(Color.parseColor("#64748B"))
+        }
+        panel.addView(emptyRoomsHint)
+
+        availableRoomsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        panel.addView(availableRoomsContainer)
         root.addView(panel)
 
         // Section Header
@@ -349,19 +336,18 @@ class MainActivity : Activity() {
                 bottomMargin = dp(10)
             }
         }
-        sectionTitleText = TextView(this).apply {
-            text = "本机媒体播放器"
+        secRow.addView(TextView(this).apply {
+            text = "房间内设备播放器"
             textSize = 13f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#94A3B8"))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
+        })
         deviceCountText = TextView(this).apply {
-            text = "未加入房间"
+            text = "共 1 台设备在线"
             textSize = 12f
             setTextColor(Color.parseColor("#64748B"))
         }
-        secRow.addView(sectionTitleText)
         secRow.addView(deviceCountText)
         root.addView(secRow)
 
@@ -377,41 +363,74 @@ class MainActivity : Activity() {
         lanNameText.text = SyncEngine.displayedLanName
         permissionBanner.visibility = if (AndroidMediaController.isNotificationAccessGranted(this)) View.GONE else View.VISIBLE
 
-        val inRoom = SyncEngine.currentRoomCode.isNotEmpty()
-        lobbyBox.visibility = if (inRoom) View.GONE else View.VISIBLE
-        activeRoomBox.visibility = if (inRoom) View.VISIBLE else View.GONE
-        roomCodeText.text = if (inRoom) SyncEngine.currentRoomCode else "----"
+        currentRoomNameText.text = SyncEngine.currentRoomName
+        val hostingOwn = SyncEngine.isHostingOwnRoom
+        roomRoleBadge.text = if (hostingOwn) "默认已开房" else "已加入对方房间"
+        roomRoleBadge.background = roundedBg(if (hostingOwn) "#143C33" else "#1E3A5F", 6)
+        roomRoleBadge.setTextColor(Color.parseColor(if (hostingOwn) "#34D399" else "#60A5FA"))
+        returnOwnRoomBtn.visibility = if (hostingOwn) View.GONE else View.VISIBLE
 
-        val rooms = SyncEngine.getDiscoveredRoomsSnapshot()
-        if (!inRoom && rooms.isNotEmpty()) {
-            discoveredRoomsRow.visibility = View.VISIBLE
-            discoveredRoomsRow.removeAllViews()
-            discoveredRoomsRow.addView(TextView(this).apply {
-                text = "局域网房间："
-                textSize = 12f
-                setTextColor(Color.parseColor("#94A3B8"))
-            })
-            for (code in rooms) {
-                discoveredRoomsRow.addView(Button(this).apply {
-                    text = "#$code"
-                    textSize = 12f
-                    typeface = Typeface.MONOSPACE
-                    setTextColor(Color.parseColor("#60A5FA"))
-                    background = roundedBg("#1E3A5F", 12)
-                    setPadding(dp(10), dp(4), dp(10), dp(4))
-                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                        marginStart = dp(6)
-                    }
-                    setOnClickListener { SyncEngine.joinRoom(code) }
-                })
-            }
+        val rooms = SyncEngine.getAvailableRoomsSnapshot()
+        availableRoomsContainer.removeAllViews()
+        if (rooms.isEmpty()) {
+            emptyRoomsHint.visibility = View.VISIBLE
         } else {
-            discoveredRoomsRow.visibility = View.GONE
+            emptyRoomsHint.visibility = View.GONE
+            for (room in rooms) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(10), dp(10), dp(10), dp(10))
+                    background = roundedBg("#0D1526", 11, "#24334F")
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                        bottomMargin = dp(8)
+                    }
+                }
+                val (pBg, pFg) = platformColors(room.hostPlatform)
+                row.addView(TextView(this).apply {
+                    text = FormatUtil.platformDisplayName(room.hostPlatform)
+                    textSize = 11f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.parseColor(pFg))
+                    background = roundedBg(pBg, 7)
+                    setPadding(dp(8), dp(3), dp(8), dp(3))
+                })
+                val infoCol = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                        marginStart = dp(10)
+                        marginEnd = dp(8)
+                    }
+                }
+                infoCol.addView(TextView(this).apply {
+                    text = room.roomName
+                    textSize = 14f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.parseColor("#F8FAFC"))
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                })
+                infoCol.addView(TextView(this).apply {
+                    text = "${room.memberCount} 台设备 · ${if (room.isLanDirect) "局域网直连" else "网络发现"}"
+                    textSize = 11f
+                    setTextColor(Color.parseColor("#94A3B8"))
+                })
+                row.addView(infoCol)
+                row.addView(Button(this).apply {
+                    text = "加入"
+                    textSize = 13f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.WHITE)
+                    background = roundedBg("#3B82F6", 9)
+                    setPadding(dp(14), dp(6), dp(14), dp(6))
+                    setOnClickListener { SyncEngine.joinRoom(room) }
+                })
+                availableRoomsContainer.addView(row)
+            }
         }
 
         val peers = SyncEngine.getRoomPeersSnapshot()
-        sectionTitleText.text = if (inRoom) "房间内设备播放器" else "本机媒体播放器"
-        deviceCountText.text = if (inRoom) "共 ${1 + peers.size} 台设备在线" else "未加入房间"
+        deviceCountText.text = "共 ${1 + peers.size} 台设备在线"
 
         val desired = ArrayList<CardData>()
         desired.add(CardData(SyncEngine.deviceId, SyncEngine.deviceName, "android", "本机", SyncEngine.localPlayer))
@@ -596,13 +615,7 @@ class MainActivity : Activity() {
         fun update(item: CardData, nowMs: Long) {
             lastPlayer = item.player
             platformBadge.text = FormatUtil.platformDisplayName(item.platform)
-            val (bg, fg) = when (item.platform.lowercase()) {
-                "windows" -> "#1E3A5F" to "#60A5FA"
-                "macos" -> "#332152" to "#C084FC"
-                "ios" -> "#4C1D3D" to "#F472B6"
-                "android" -> "#143C33" to "#34D399"
-                else -> "#1E293B" to "#CBD5E1"
-            }
+            val (bg, fg) = platformColors(item.platform)
             platformBadge.background = roundedBg(bg, 7)
             platformBadge.setTextColor(Color.parseColor(fg))
 

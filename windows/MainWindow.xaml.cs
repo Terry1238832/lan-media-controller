@@ -2,7 +2,6 @@ using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
-using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
@@ -98,89 +97,109 @@ public partial class MainWindow : Window
         _engine.SaveDeviceName(DeviceNameBox.Text);
     }
 
-    private void CreateRoomBtn_Click(object sender, RoutedEventArgs e)
+    private void ReturnOwnRoomBtn_Click(object sender, RoutedEventArgs e)
     {
-        _engine.CreateRoom();
-    }
-
-    private void JoinRoomBtn_Click(object sender, RoutedEventArgs e)
-    {
-        _engine.JoinRoom(JoinCodeBox.Text);
-        JoinCodeBox.Text = "";
-    }
-
-    private void JoinCodeBox_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-    {
-        if (e.Key == Key.Enter)
-        {
-            _engine.JoinRoom(JoinCodeBox.Text);
-            JoinCodeBox.Text = "";
-        }
-    }
-
-    private void CopyCodeBtn_Click(object sender, RoutedEventArgs e)
-    {
-        if (string.IsNullOrEmpty(_engine.CurrentRoomCode)) return;
-        System.Windows.Clipboard.SetText(_engine.CurrentRoomCode);
-        CopyCodeBtn.Content = "已复制";
-        var reset = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.5) };
-        reset.Tick += (_, _) => { CopyCodeBtn.Content = "复制"; reset.Stop(); };
-        reset.Start();
-    }
-
-    private void LeaveRoomBtn_Click(object sender, RoutedEventArgs e)
-    {
-        _engine.LeaveRoom();
+        _engine.ReturnToOwnRoom();
     }
 
     private void RefreshUI()
     {
         LanNameText.Text = _engine.DisplayedLanName;
+        CurrentRoomNameText.Text = _engine.CurrentRoomName;
 
-        bool inRoom = !string.IsNullOrEmpty(_engine.CurrentRoomCode);
-        LobbyPanel.Visibility = inRoom ? Visibility.Collapsed : Visibility.Visible;
-        ActiveRoomPanel.Visibility = inRoom ? Visibility.Visible : Visibility.Collapsed;
-        RoomCodeText.Text = inRoom ? _engine.CurrentRoomCode : "----";
+        bool hostingOwn = _engine.IsHostingOwnRoom;
+        RoomRoleText.Text = hostingOwn ? "默认已开房" : "已加入对方房间";
+        RoomRoleBadge.Background = BrushFromHex(hostingOwn ? "#143C33" : "#1E3A5F");
+        RoomRoleText.Foreground = BrushFromHex(hostingOwn ? "#34D399" : "#60A5FA");
+        ReturnOwnRoomBtn.Visibility = hostingOwn ? Visibility.Collapsed : Visibility.Visible;
 
-        var rooms = _engine.GetDiscoveredRoomsSnapshot();
-        if (!inRoom && rooms.Count > 0)
+        var rooms = _engine.GetAvailableRoomsSnapshot();
+        AvailableRoomsPanel.Children.Clear();
+        if (rooms.Count == 0)
         {
-            DiscoveredRoomsPanel.Visibility = Visibility.Visible;
-            DiscoveredRoomsPanel.Children.Clear();
-            DiscoveredRoomsPanel.Children.Add(new TextBlock
-            {
-                Text = "局域网房间：",
-                FontSize = 12,
-                Foreground = BrushFromHex("#94A3B8"),
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 6, 4)
-            });
-            foreach (var code in rooms)
-            {
-                var btn = new System.Windows.Controls.Button
-                {
-                    Content = $"#{code}",
-                    Style = (Style)FindResource("DarkButtonStyle"),
-                    Background = BrushFromHex("#1E3A5F"),
-                    Foreground = BrushFromHex("#60A5FA"),
-                    FontFamily = new System.Windows.Media.FontFamily("Consolas"),
-                    FontSize = 12,
-                    Padding = new Thickness(10, 4, 10, 4),
-                    Margin = new Thickness(0, 0, 6, 4)
-                };
-                var roomCodeCopy = code;
-                btn.Click += (_, _) => _engine.JoinRoom(roomCodeCopy);
-                DiscoveredRoomsPanel.Children.Add(btn);
-            }
+            EmptyRoomsHint.Visibility = Visibility.Visible;
         }
         else
         {
-            DiscoveredRoomsPanel.Visibility = Visibility.Collapsed;
+            EmptyRoomsHint.Visibility = Visibility.Collapsed;
+            var btnStyle = (Style)FindResource("DarkButtonStyle");
+            foreach (var room in rooms)
+            {
+                var roomCopy = room;
+                var rowBorder = new Border
+                {
+                    Background = BrushFromHex("#0D1526"),
+                    BorderBrush = BrushFromHex("#24334F"),
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(11),
+                    Padding = new Thickness(10),
+                    Margin = new Thickness(0, 0, 0, 8)
+                };
+
+                var rowGrid = new Grid();
+                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                var (pBg, pFg) = PlatformColors(room.HostPlatform);
+                var pBadge = new Border
+                {
+                    Background = BrushFromHex(pBg),
+                    CornerRadius = new CornerRadius(7),
+                    Padding = new Thickness(8, 3, 8, 3),
+                    Margin = new Thickness(0, 0, 10, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Child = new TextBlock
+                    {
+                        Text = ProtocolJson.PlatformDisplayName(room.HostPlatform),
+                        FontSize = 11,
+                        FontWeight = FontWeights.Bold,
+                        Foreground = BrushFromHex(pFg)
+                    }
+                };
+
+                var infoStack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+                infoStack.Children.Add(new TextBlock
+                {
+                    Text = room.RoomName,
+                    FontSize = 14,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = BrushFromHex("#F8FAFC"),
+                    TextTrimming = TextTrimming.CharacterEllipsis
+                });
+                infoStack.Children.Add(new TextBlock
+                {
+                    Text = $"{room.MemberCount} 台设备 · {(room.IsLanDirect ? "局域网直连" : "网络发现")}",
+                    FontSize = 11,
+                    Foreground = BrushFromHex("#94A3B8"),
+                    Margin = new Thickness(0, 2, 0, 0)
+                });
+
+                var joinBtn = new System.Windows.Controls.Button
+                {
+                    Content = "加入",
+                    Style = btnStyle,
+                    Background = BrushFromHex("#3B82F6"),
+                    FontSize = 13,
+                    FontWeight = FontWeights.Bold,
+                    Padding = new Thickness(14, 7, 14, 7),
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                joinBtn.Click += (_, _) => _engine.JoinRoom(roomCopy);
+
+                Grid.SetColumn(pBadge, 0);
+                Grid.SetColumn(infoStack, 1);
+                Grid.SetColumn(joinBtn, 2);
+                rowGrid.Children.Add(pBadge);
+                rowGrid.Children.Add(infoStack);
+                rowGrid.Children.Add(joinBtn);
+                rowBorder.Child = rowGrid;
+                AvailableRoomsPanel.Children.Add(rowBorder);
+            }
         }
 
         var peers = _engine.GetRoomPeersSnapshot();
-        SectionTitleText.Text = inRoom ? "房间内设备播放器" : "本机媒体播放器";
-        DeviceCountText.Text = inRoom ? $"共 {1 + peers.Count} 台设备在线" : "未加入房间";
+        DeviceCountText.Text = $"共 {1 + peers.Count} 台设备在线";
 
         var desired = new List<(string id, string name, string platform, string connMode, PlayerState player)>
         {
@@ -198,16 +217,15 @@ public partial class MainWindow : Window
         }
 
         var now = ProtocolJson.NowMillis();
-        for (int i = 0; i < desired.Count; i++)
+        foreach (var item in desired)
         {
-            var item = desired[i];
             if (!_cards.TryGetValue(item.id, out var card))
             {
+                var targetId = item.id;
                 card = new PlayerCardWidget(
-                    item.id,
                     (Style)FindResource("DarkButtonStyle"),
-                    (action, pos) => _engine.SendCommand(item.id, action, pos));
-                _cards[item.id] = card;
+                    (action, pos) => _engine.SendCommand(targetId, action, pos));
+                _cards[targetId] = card;
                 PlayersContainer.Children.Add(card.Root);
             }
             card.Update(item.name, item.platform, item.connMode, item.player, now);
@@ -221,8 +239,20 @@ public partial class MainWindow : Window
             card.TickTimeline(now);
     }
 
-    internal static SolidColorBrush BrushFromHex(string hex) =>
-        (SolidColorBrush)new BrushConverter().ConvertFromString(hex)!;
+    internal static (string bg, string fg) PlatformColors(string platform) => platform.ToLowerInvariant() switch
+    {
+        "windows" => ("#1E3A5F", "#60A5FA"),
+        "macos" => ("#332152", "#C084FC"),
+        "ios" => ("#4C1D3D", "#F472B6"),
+        "android" => ("#143C33", "#34D399"),
+        _ => ("#1E293B", "#CBD5E1")
+    };
+
+    internal static SolidColorBrush BrushFromHex(string hex)
+    {
+        var converted = new BrushConverter().ConvertFromString(hex) as SolidColorBrush;
+        return converted ?? new SolidColorBrush(Colors.White);
+    }
 }
 
 internal sealed class PlayerCardWidget
@@ -245,7 +275,7 @@ internal sealed class PlayerCardWidget
     private PlayerState _lastPlayer = new();
     private bool _isDragging;
 
-    public PlayerCardWidget(string deviceId, Style buttonStyle, Action<string, double> onCommand)
+    public PlayerCardWidget(Style buttonStyle, Action<string, double> onCommand)
     {
         _platformText = new TextBlock { FontSize = 11, FontWeight = FontWeights.Bold };
         _platformBadge = new Border { CornerRadius = new CornerRadius(7), Padding = new Thickness(9, 3, 9, 3), Margin = new Thickness(0, 0, 8, 0), Child = _platformText };
@@ -370,14 +400,7 @@ internal sealed class PlayerCardWidget
         _lastPlayer = player.Clone();
 
         _platformText.Text = ProtocolJson.PlatformDisplayName(platform);
-        var (badgeBg, badgeFg) = platform.ToLowerInvariant() switch
-        {
-            "windows" => ("#1E3A5F", "#60A5FA"),
-            "macos" => ("#332152", "#C084FC"),
-            "ios" => ("#4C1D3D", "#F472B6"),
-            "android" => ("#143C33", "#34D399"),
-            _ => ("#1E293B", "#CBD5E1")
-        };
+        var (badgeBg, badgeFg) = MainWindow.PlatformColors(platform);
         _platformBadge.Background = MainWindow.BrushFromHex(badgeBg);
         _platformText.Foreground = MainWindow.BrushFromHex(badgeFg);
 

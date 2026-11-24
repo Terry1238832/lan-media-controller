@@ -13,13 +13,13 @@ import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.ServerSocket
 import java.net.URL
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
-import kotlin.random.Random
 
 object SyncEngine {
     const val UDP_PORT = 41234
@@ -32,8 +32,7 @@ object SyncEngine {
     private val ioExecutor = Executors.newCachedThreadPool()
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
 
-    private val peersById = HashMap<String, DeviceRecord>()
-    private val discoveredRooms = HashMap<String, Long>()
+    private val allPeersById = HashMap<String, DeviceRecord>()
     private val executedCmdIds = ConcurrentHashMap.newKeySet<String>()
     private val listeners = ConcurrentHashMap.newKeySet<() -> Unit>()
     private val startupMs = System.currentTimeMillis()
@@ -43,7 +42,7 @@ object SyncEngine {
     @Volatile private var udpSocket: MulticastSocket? = null
     @Volatile private var httpServer: ServerSocket? = null
     @Volatile private var relayThread: Thread? = null
-    @Volatile private var relayRoomToken: String = ""
+    @Volatile private var homeRelayTopic: String = ""
     @Volatile private var heartbeatFuture: ScheduledFuture<*>? = null
     @Volatile private var tickCount = 0
 
@@ -51,12 +50,17 @@ object SyncEngine {
         private set
     @Volatile var deviceName: String = ""
         private set
-    @Volatile var currentRoomCode: String = ""
+    @Volatile var currentRoomId: String = ""
+        private set
+    @Volatile var currentRoomName: String = ""
         private set
     @Volatile var displayedLanName: String = "正在检测局域网..."
         private set
     @Volatile var localPlayer: PlayerState = PlayerState()
         private set
+
+    val isHostingOwnRoom: Boolean
+        get() = currentRoomId == deviceId
 
     @Volatile private var localIp: String = ""
     @Volatile private var localSubnet: String = ""
@@ -92,15 +96,19 @@ object SyncEngine {
             prefs.edit().putString("device_name", model).apply()
             model
         }
+        // Default on launch: immediately host our own room named "<deviceName>的房间"
+        currentRoomId = deviceId
+        currentRoomName = "${deviceName}的房间"
 
         refreshNetworkInfo()
         startUdp()
         startHttpServer()
+        resolveHomeRelayAndConnect()
 
         AndroidMediaController.init(context.applicationContext) { state ->
             localPlayer = state
             notifyUpdated()
-            ioExecutor.execute { broadcastPresence(includeRelay = currentRoomCode.isNotEmpty()) }
+            ioExecutor.execute { broadcastPresence(includeRelay = true) }
         }
 
         heartbeatFuture = scheduler.scheduleAtFixedRate({
@@ -109,7 +117,7 @@ object SyncEngine {
                 if (tickCount % 10 == 0) refreshNetworkInfo()
                 AndroidMediaController.refreshState()
                 pruneStalePeers()
-                broadcastPresence(includeRelay = currentRoomCode.isNotEmpty() && (tickCount % 2 == 0))
+                broadcastPresence(includeRelay = tickCount % 2 == 0)
             } catch (_: Exception) {}
         }, 400, 1500, TimeUnit.MILLISECONDS)
     }
@@ -117,53 +125,64 @@ object SyncEngine {
     fun saveDeviceName(name: String) {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return
-        deviceName = trimmed
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("device_name", trimmed)?.apply()
-        notifyUpdated()
-        ioExecutor.execute { broadcastPresence(includeRelay = currentRoomCode.isNotEmpty()) }
-    }
-
-    fun createRoom() {
-        val code = Random.nextInt(1000, 10000).toString()
-        joinRoom(code)
-    }
-
-    fun joinRoom(code: String) {
-        val clean = code.trim()
-        if (clean.length != 4 || !clean.all { it.isDigit() }) return
-        val old = currentRoomCode
-        if (old.isNotEmpty() && old != clean) {
-            ioExecutor.execute { sendLeave(old) }
-        }
         synchronized(lock) {
-            currentRoomCode = clean
-            peersById.clear()
+            deviceName = trimmed
+            if (currentRoomId == deviceId) {
+                currentRoomName = "${trimmed}的房间"
+            }
         }
-        startRelaySubscription(clean)
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("device_name", trimmed)?.apply()
         notifyUpdated()
         ioExecutor.execute { broadcastPresence(includeRelay = true) }
     }
 
-    fun leaveRoom() {
-        val old = currentRoomCode
-        stopRelaySubscription()
-        synchronized(lock) {
-            currentRoomCode = ""
-            peersById.clear()
-        }
+    fun joinRoom(room: AvailableRoom) {
+        if (room.roomId.isEmpty() || room.roomId == currentRoomId) return
+        val old = currentRoomId
         if (old.isNotEmpty()) {
             ioExecutor.execute { sendLeave(old) }
         }
+        synchronized(lock) {
+            currentRoomId = room.roomId
+            currentRoomName = room.roomName
+        }
         notifyUpdated()
-        ioExecutor.execute { broadcastPresence(includeRelay = false) }
+        ioExecutor.execute { broadcastPresence(includeRelay = true) }
+    }
+
+    fun returnToOwnRoom() {
+        if (currentRoomId == deviceId) return
+        val old = currentRoomId
+        ioExecutor.execute { sendLeave(old) }
+        synchronized(lock) {
+            currentRoomId = deviceId
+            currentRoomName = "${deviceName}的房间"
+        }
+        notifyUpdated()
+        ioExecutor.execute { broadcastPresence(includeRelay = true) }
     }
 
     fun getRoomPeersSnapshot(): List<DeviceRecord> = synchronized(lock) {
-        peersById.values.sortedBy { it.deviceName.lowercase() }
+        allPeersById.values
+            .filter { it.roomId == currentRoomId }
+            .sortedBy { it.deviceName.lowercase() }
     }
 
-    fun getDiscoveredRoomsSnapshot(): List<String> = synchronized(lock) {
-        discoveredRooms.keys.sorted()
+    fun getAvailableRoomsSnapshot(): List<AvailableRoom> = synchronized(lock) {
+        allPeersById.values
+            .filter { it.roomId != currentRoomId }
+            .groupBy { it.roomId }
+            .map { (rId, members) ->
+                val host = members.firstOrNull { it.deviceId == rId } ?: members.first()
+                AvailableRoom(
+                    roomId = rId,
+                    roomName = host.roomName.ifBlank { "${host.deviceName}的房间" },
+                    hostPlatform = host.platform,
+                    memberCount = members.size,
+                    isLanDirect = members.any { it.connectionMode == "局域网直连" }
+                )
+            }
+            .sortedBy { it.roomName.lowercase() }
     }
 
     fun sendCommand(targetDeviceId: String, action: String, position: Double = 0.0) {
@@ -174,7 +193,7 @@ object SyncEngine {
                 AndroidMediaController.executeCommand(action, position)
                 Thread.sleep(220)
                 AndroidMediaController.refreshState()
-                broadcastPresence(includeRelay = currentRoomCode.isNotEmpty())
+                broadcastPresence(includeRelay = true)
             }
             return
         }
@@ -185,7 +204,7 @@ object SyncEngine {
             put("v", 2)
             put("type", "command")
             put("cmdId", cmdId)
-            put("roomCode", currentRoomCode)
+            put("roomId", currentRoomId)
             put("targetDeviceId", targetDeviceId)
             put("action", action)
             put("position", position)
@@ -195,9 +214,9 @@ object SyncEngine {
         var peerIp = ""
         var peerPort = 0
         synchronized(lock) {
-            val peer = peersById[targetDeviceId]
+            val peer = allPeersById[targetDeviceId]
             if (peer != null) {
-                peersById[targetDeviceId] = peer.copy(player = applyOptimistic(peer.player, action, position))
+                allPeersById[targetDeviceId] = peer.copy(player = applyOptimistic(peer.player, action, position))
                 peerIp = peer.ip
                 peerPort = peer.httpPort
             }
@@ -209,9 +228,9 @@ object SyncEngine {
                 sendHttpPost("http://$peerIp:$peerPort/api/command", cmdJson)
                 sendUdpString(cmdJson, peerIp)
             }
-            val room = currentRoomCode
-            if (room.isNotEmpty()) {
-                sendHttpPost("$RELAY_BASE/lmc_v2_r_$room", cmdJson)
+            val topic = homeRelayTopic
+            if (topic.isNotEmpty()) {
+                sendHttpPost("$RELAY_BASE/$topic", cmdJson)
             }
         }
     }
@@ -252,6 +271,76 @@ object SyncEngine {
         }
     }
 
+    private fun resolveHomeRelayAndConnect() {
+        ioExecutor.execute {
+            val endpoints = listOf("https://api4.ipify.org", "https://ipv4.icanhazip.com")
+            var publicIp = ""
+            for (ep in endpoints) {
+                try {
+                    val conn = (URL(ep).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 3000
+                        readTimeout = 3000
+                    }
+                    val str = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText().trim() }
+                    conn.disconnect()
+                    if (str.split(".").size == 4) {
+                        publicIp = str
+                        break
+                    }
+                } catch (_: Exception) {}
+            }
+            if (publicIp.isEmpty()) return@execute
+
+            val digest = MessageDigest.getInstance("SHA-256").digest("lmc-v2-home:$publicIp".toByteArray(Charsets.UTF_8))
+            val hex = digest.joinToString("") { "%02x".format(it) }.take(16)
+            val topic = "lmc_v2_home_$hex"
+            homeRelayTopic = topic
+            startRelaySubscription(topic)
+            broadcastPresence(includeRelay = true)
+        }
+    }
+
+    private fun startRelaySubscription(topic: String) {
+        try { relayThread?.interrupt() } catch (_: Exception) {}
+        val t = Thread {
+            val urlStr = "$RELAY_BASE/$topic/sse?since=1m"
+            while (started && homeRelayTopic == topic && !Thread.currentThread().isInterrupted) {
+                var conn: HttpURLConnection? = null
+                try {
+                    conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 5000
+                        readTimeout = 60000
+                    }
+                    BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { reader ->
+                        while (started && homeRelayTopic == topic) {
+                            val line = reader.readLine() ?: break
+                            if (!line.startsWith("data:")) continue
+                            val raw = line.substring(5).trim()
+                            try {
+                                val outer = JSONObject(raw)
+                                if (outer.optString("event") == "message") {
+                                    val inner = outer.optString("message", "")
+                                    if (inner.isNotBlank()) {
+                                        handleIncomingJson(inner, "网络同步", "")
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
+                } catch (_: Exception) {
+                    try { Thread.sleep(2000) } catch (_: InterruptedException) { break }
+                } finally {
+                    try { conn?.disconnect() } catch (_: Exception) {}
+                }
+            }
+        }
+        t.isDaemon = true
+        t.start()
+        relayThread = t
+    }
+
     private fun startUdp() {
         ioExecutor.execute {
             try {
@@ -259,9 +348,7 @@ object SyncEngine {
                 sock.reuseAddress = true
                 sock.broadcast = true
                 sock.bind(InetSocketAddress(UDP_PORT))
-                try {
-                    sock.joinGroup(InetAddress.getByName(MULTICAST_GROUP))
-                } catch (_: Exception) {}
+                try { sock.joinGroup(InetAddress.getByName(MULTICAST_GROUP)) } catch (_: Exception) {}
                 udpSocket = sock
 
                 val buf = ByteArray(8192)
@@ -321,14 +408,14 @@ object SyncEngine {
     }
 
     private fun broadcastPresence(includeRelay: Boolean) {
-        val room = currentRoomCode
         val json = JSONObject().apply {
             put("v", 2)
             put("type", "presence")
             put("deviceId", deviceId)
             put("deviceName", deviceName)
             put("platform", "android")
-            put("roomCode", room)
+            put("roomId", currentRoomId)
+            put("roomName", currentRoomName)
             put("lanName", resolvedRealSsid)
             put("ip", localIp)
             put("subnet", localSubnet)
@@ -343,24 +430,28 @@ object SyncEngine {
         targets.add("255.255.255.255")
         for (host in targets) sendUdpString(json, host)
 
-        if (includeRelay && room.isNotEmpty()) {
-            sendHttpPost("$RELAY_BASE/lmc_v2_r_$room", json)
+        val topic = homeRelayTopic
+        if (includeRelay && topic.isNotEmpty()) {
+            sendHttpPost("$RELAY_BASE/$topic", json)
         }
     }
 
-    private fun sendLeave(roomCode: String) {
+    private fun sendLeave(roomId: String) {
         val json = JSONObject().apply {
             put("v", 2)
             put("type", "leave")
             put("deviceId", deviceId)
-            put("roomCode", roomCode)
+            put("roomId", roomId)
             put("ts", System.currentTimeMillis())
         }.toString()
         val targets = linkedSetOf<String>()
         targets.addAll(broadcastAddresses)
         targets.add(MULTICAST_GROUP)
         for (host in targets) sendUdpString(json, host)
-        sendHttpPost("$RELAY_BASE/lmc_v2_r_$roomCode", json)
+        val topic = homeRelayTopic
+        if (topic.isNotEmpty()) {
+            sendHttpPost("$RELAY_BASE/$topic", json)
+        }
     }
 
     private fun sendUdpString(payload: String, host: String) {
@@ -392,53 +483,6 @@ object SyncEngine {
         } catch (_: Exception) {}
     }
 
-    private fun startRelaySubscription(roomCode: String) {
-        stopRelaySubscription()
-        relayRoomToken = roomCode
-        val t = Thread {
-            val urlStr = "$RELAY_BASE/lmc_v2_r_$roomCode/sse?since=2m"
-            while (started && relayRoomToken == roomCode && !Thread.currentThread().isInterrupted) {
-                var conn: HttpURLConnection? = null
-                try {
-                    conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        connectTimeout = 5000
-                        readTimeout = 60000
-                    }
-                    BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { reader ->
-                        while (started && relayRoomToken == roomCode) {
-                            val line = reader.readLine() ?: break
-                            if (!line.startsWith("data:")) continue
-                            val raw = line.substring(5).trim()
-                            try {
-                                val outer = JSONObject(raw)
-                                if (outer.optString("event") == "message") {
-                                    val inner = outer.optString("message", "")
-                                    if (inner.isNotBlank()) {
-                                        handleIncomingJson(inner, "中继同步", "")
-                                    }
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    }
-                } catch (_: Exception) {
-                    try { Thread.sleep(2000) } catch (_: InterruptedException) { break }
-                } finally {
-                    try { conn?.disconnect() } catch (_: Exception) {}
-                }
-            }
-        }
-        t.isDaemon = true
-        t.start()
-        relayThread = t
-    }
-
-    private fun stopRelaySubscription() {
-        relayRoomToken = ""
-        try { relayThread?.interrupt() } catch (_: Exception) {}
-        relayThread = null
-    }
-
     private fun handleIncomingJson(raw: String, sourceMode: String, senderIp: String) {
         try {
             val obj = JSONObject(raw)
@@ -460,78 +504,84 @@ object SyncEngine {
                         updateDisplayedLanName()
                     }
 
-                    val roomCode = obj.optString("roomCode", "")
+                    val devName = obj.optString("deviceName", "设备")
+                    val roomId = obj.optString("roomId", "").ifBlank { devId }
+                    val roomName = obj.optString("roomName", "").ifBlank { "${devName}的房间" }
                     val pktTs = obj.optLong("ts", now)
                     val effIp = senderIp.ifEmpty { obj.optString("ip", "") }
                     val player = PlayerState.fromJson(obj.optJSONObject("player"))
 
-                    var changed = false
                     var shouldReply = false
                     synchronized(lock) {
-                        if (sourceMode == "局域网直连" && roomCode.length == 4 && roomCode.all { it.isDigit() }) {
-                            if (!discoveredRooms.containsKey(roomCode)) changed = true
-                            discoveredRooms[roomCode] = now
+                        if (roomId == currentRoomId && devId == roomId && roomName.isNotBlank()) {
+                            currentRoomName = roomName
                         }
-                        if (currentRoomCode.isNotEmpty() && roomCode == currentRoomCode) {
-                            val existing = peersById[devId]
-                            if (existing != null) {
-                                if (pktTs < existing.lastPacketTs) return
-                                val mode = if (sourceMode == "局域网直连" || existing.connectionMode == "局域网直连") "局域网直连" else "中继同步"
-                                peersById[devId] = existing.copy(
-                                    deviceName = obj.optString("deviceName", existing.deviceName),
-                                    platform = obj.optString("platform", existing.platform),
-                                    lanName = peerLanName,
-                                    ip = effIp.ifEmpty { existing.ip },
-                                    subnet = peerSubnet,
-                                    httpPort = obj.optInt("httpPort", existing.httpPort),
-                                    lastSeen = now,
-                                    lastPacketTs = pktTs,
-                                    connectionMode = mode,
-                                    player = player
-                                )
-                                changed = true
-                            } else {
-                                peersById[devId] = DeviceRecord(
-                                    deviceId = devId,
-                                    deviceName = obj.optString("deviceName", "设备"),
-                                    platform = obj.optString("platform", "windows"),
-                                    roomCode = roomCode,
-                                    lanName = peerLanName,
-                                    ip = effIp,
-                                    subnet = peerSubnet,
-                                    httpPort = obj.optInt("httpPort", 41235),
-                                    lastSeen = now,
-                                    lastPacketTs = pktTs,
-                                    connectionMode = sourceMode,
-                                    player = player
-                                )
-                                shouldReply = true
-                                changed = true
-                            }
+
+                        val existing = allPeersById[devId]
+                        if (existing != null) {
+                            if (pktTs < existing.lastPacketTs) return
+                            val mode = if (sourceMode == "局域网直连" || existing.connectionMode == "局域网直连") "局域网直连" else "网络同步"
+                            allPeersById[devId] = existing.copy(
+                                deviceName = devName,
+                                platform = obj.optString("platform", existing.platform),
+                                roomId = roomId,
+                                roomName = roomName,
+                                lanName = peerLanName,
+                                ip = effIp.ifEmpty { existing.ip },
+                                subnet = peerSubnet,
+                                httpPort = obj.optInt("httpPort", existing.httpPort),
+                                lastSeen = now,
+                                lastPacketTs = pktTs,
+                                connectionMode = mode,
+                                player = player
+                            )
+                        } else {
+                            allPeersById[devId] = DeviceRecord(
+                                deviceId = devId,
+                                deviceName = devName,
+                                platform = obj.optString("platform", "windows"),
+                                roomId = roomId,
+                                roomName = roomName,
+                                lanName = peerLanName,
+                                ip = effIp,
+                                subnet = peerSubnet,
+                                httpPort = obj.optInt("httpPort", 41235),
+                                lastSeen = now,
+                                lastPacketTs = pktTs,
+                                connectionMode = sourceMode,
+                                player = player
+                            )
+                            shouldReply = true
                         }
                     }
-                    if (changed) notifyUpdated()
+                    notifyUpdated()
                     if (shouldReply) ioExecutor.execute { broadcastPresence(includeRelay = true) }
                 }
 
                 "leave" -> {
                     val devId = obj.optString("deviceId", "")
+                    val leftRoom = obj.optString("roomId", "")
                     val pktTs = obj.optLong("ts", now)
-                    var removed = false
+                    var changed = false
                     synchronized(lock) {
-                        val existing = peersById[devId]
-                        if (existing != null && pktTs >= existing.lastPacketTs) {
-                            peersById.remove(devId)
-                            removed = true
+                        val existing = allPeersById[devId]
+                        if (existing != null && pktTs >= existing.lastPacketTs && existing.roomId == leftRoom) {
+                            allPeersById[devId] = existing.copy(
+                                roomId = existing.deviceId,
+                                roomName = "${existing.deviceName}的房间",
+                                lastPacketTs = pktTs
+                            )
+                            changed = true
                         }
                     }
-                    if (removed) notifyUpdated()
+                    if (changed) notifyUpdated()
                 }
 
                 "command" -> {
                     val cmdId = obj.optString("cmdId", "")
                     val pktTs = obj.optLong("ts", now)
-                    if (cmdId.isEmpty() || pktTs < startupMs - 5000) return
+                    val roomId = obj.optString("roomId", "")
+                    if (cmdId.isEmpty() || pktTs < startupMs - 5000 || roomId != currentRoomId) return
                     if (!executedCmdIds.add(cmdId)) return
 
                     val targetId = obj.optString("targetDeviceId", "")
@@ -544,7 +594,7 @@ object SyncEngine {
                             AndroidMediaController.executeCommand(action, pos)
                             Thread.sleep(220)
                             AndroidMediaController.refreshState()
-                            broadcastPresence(includeRelay = currentRoomCode.isNotEmpty())
+                            broadcastPresence(includeRelay = true)
                         }
                     }
                 }
@@ -556,10 +606,8 @@ object SyncEngine {
         val now = System.currentTimeMillis()
         var changed = false
         synchronized(lock) {
-            val stalePeers = peersById.filterValues { now - it.lastSeen > 14_000 }.keys.toList()
-            for (id in stalePeers) { peersById.remove(id); changed = true }
-            val staleRooms = discoveredRooms.filterValues { now - it > 15_000 }.keys.toList()
-            for (r in staleRooms) { discoveredRooms.remove(r); changed = true }
+            val stale = allPeersById.filterValues { now - it.lastSeen > 14_000 }.keys.toList()
+            for (id in stale) { allPeersById.remove(id); changed = true }
         }
         if (changed) notifyUpdated()
     }

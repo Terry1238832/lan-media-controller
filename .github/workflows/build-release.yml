@@ -43,12 +43,12 @@ jobs:
 
           swiftc -O -parse-as-library -swift-version 5 \
             -sdk "$SDK_PATH" -target arm64-apple-macos13.0 \
-            -framework SwiftUI -framework AppKit -framework CoreWLAN -framework Network -framework Foundation \
+            -framework SwiftUI -framework AppKit -framework CoreWLAN -framework Network -framework CryptoKit -framework Foundation \
             "${SWIFT_FILES[@]}" -o build/macos/LanMediaController-arm64
 
           swiftc -O -parse-as-library -swift-version 5 \
             -sdk "$SDK_PATH" -target x86_64-apple-macos13.0 \
-            -framework SwiftUI -framework AppKit -framework CoreWLAN -framework Network -framework Foundation \
+            -framework SwiftUI -framework AppKit -framework CoreWLAN -framework Network -framework CryptoKit -framework Foundation \
             "${SWIFT_FILES[@]}" -o build/macos/LanMediaController-x86_64
 
           lipo -create \
@@ -190,25 +190,25 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Create or update Pre-release v2.0.0-alpha.1
+      - name: Create or update Pre-release v2.1.0-alpha.1
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ls -lh release-assets/
-          TAG="v2.0.0-alpha.1"
+          TAG="v2.1.0-alpha.1"
           cat <<'EOF' > /tmp/release_notes.md
-          ## 四端局域网媒体控制器 v2.0.0-alpha.1（全平台原生重构版）
+          ## 四端局域网媒体控制器 v2.1.0-alpha.1（免匹配码 · 启动自动开房版）
 
-          - **macOS (`LanMediaController-macOS.dmg`)**：真正的 SwiftUI 原生通用二进制 App（arm64 + x86_64），由 Apple 官方 `hdiutil` 打包支持拖拽安装；内置编译好的 `ungive/mediaremote-adapter`，完美支持 macOS 13–27 实时识别与控制 **QQ音乐、网易云音乐、Spotify、Apple Music、浏览器**（歌名、进度条拖动播放、播放/暂停、上一章/下一章）。
-          - **Windows (`LanMediaController-Windows-Portable.exe`)**：真正的 .NET 8 原生 WPF 桌面应用（单文件便携版，无浏览器弹窗、无端口冲突），直接调用 WinRT GSMTC 系统媒体接口与 `wlanapi.dll` 真实 Wi-Fi 名称。
-          - **Android (`LanMediaController-Android.apk`)**：真正的 Kotlin 原生 Android 应用，集成 `NotificationListenerService + MediaSessionManager` 与后台前台服务，支持真实读取与控制本机及房间内设备。
-          - **局域网直连 + 房间同步**：4 位数独立开房间 / 加入 / 退出，支持局域网 UDP 广播直连与房间中继自动兜底。
+          - **取消匹配码，启动自动开房**：打开软件默认直接创建「`<设备名>的房间`」，同一网络下的其他设备会自动出现在可加入列表中，点击「加入」即可一键进入对方房间控制播放，随时可点击「回到我的房间」。
+          - **macOS (`LanMediaController-macOS.dmg`)**：真正的 SwiftUI 通用二进制 App（arm64 + x86_64），Apple 官方 `hdiutil` 打包拖拽安装；内置 `ungive/mediaremote-adapter`，完美支持 macOS 13–27 实时识别与控制 **QQ音乐、网易云音乐、Spotify、Apple Music、浏览器**。
+          - **Windows (`LanMediaController-Windows-Portable.exe`)**：真正的 .NET 8 原生 WPF 桌面应用（单文件便携版），原生 WinRT GSMTC 媒体控制与 `wlanapi.dll` 真实 Wi-Fi 名称。
+          - **Android (`LanMediaController-Android.apk`)**：真正的 Kotlin 原生应用，集成 `NotificationListenerService + MediaSessionManager` 与后台前台同步服务。
           EOF
           sed -i 's/^          //' /tmp/release_notes.md
 
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release edit "$TAG" --repo "${{ github.repository }}" --title "v2.0.0-alpha.1 (全平台原生重构版)" --notes-file /tmp/release_notes.md --prerelease
+            gh release edit "$TAG" --repo "${{ github.repository }}" --title "v2.1.0-alpha.1 (免匹配码 · 启动自动开房版)" --notes-file /tmp/release_notes.md --prerelease
             gh release upload "$TAG" \
               release-assets/LanMediaController-macOS.dmg \
               release-assets/LanMediaController-Windows-Portable.exe \
@@ -220,7 +220,7 @@ jobs:
               release-assets/LanMediaController-Windows-Portable.exe \
               release-assets/LanMediaController-Android.apk \
               --repo "${{ github.repository }}" \
-              --title "v2.0.0-alpha.1 (全平台原生重构版)" \
+              --title "v2.1.0-alpha.1 (免匹配码 · 启动自动开房版)" \
               --notes-file /tmp/release_notes.md \
               --prerelease
           fi

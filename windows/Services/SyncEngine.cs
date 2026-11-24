@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using LanMediaController.Models;
@@ -20,14 +21,13 @@ public sealed class SyncEngine : IDisposable
     private readonly HttpClient _sseClient = new() { Timeout = Timeout.InfiniteTimeSpan };
     private readonly object _stateLock = new();
 
-    private readonly Dictionary<string, DeviceRecord> _peersById = new();
-    private readonly Dictionary<string, long> _discoveredRooms = new();
+    private readonly Dictionary<string, DeviceRecord> _allPeersById = new();
     private readonly ConcurrentDictionary<string, byte> _executedCmdIds = new();
     private readonly long _startupMs = ProtocolJson.NowMillis();
 
     private UdpClient? _udpClient;
     private TcpListener? _tcpListener;
-    private CancellationTokenSource _cts = new();
+    private readonly CancellationTokenSource _cts = new();
     private CancellationTokenSource? _relayCts;
     private System.Threading.Timer? _heartbeatTimer;
     private int _heartbeatTick;
@@ -38,10 +38,13 @@ public sealed class SyncEngine : IDisposable
     private string _resolvedRealSsid = "";
     private List<string> _broadcastAddresses = new() { "255.255.255.255" };
     private int _httpPort = 41235;
+    private string _homeRelayTopic = "";
 
     public string DeviceId { get; private set; } = "";
     public string DeviceName { get; private set; } = "";
-    public string CurrentRoomCode { get; private set; } = "";
+    public string CurrentRoomId { get; private set; } = "";
+    public string CurrentRoomName { get; private set; } = "";
+    public bool IsHostingOwnRoom => CurrentRoomId == DeviceId;
     public string DisplayedLanName { get; private set; } = "正在检测局域网...";
     public PlayerState LocalPlayer { get; private set; } = new();
 
@@ -53,6 +56,9 @@ public sealed class SyncEngine : IDisposable
     public SyncEngine()
     {
         LoadOrCreateConfig();
+        // Default on launch: immediately host our own room named "<DeviceName>的房间"
+        CurrentRoomId = DeviceId;
+        CurrentRoomName = $"{DeviceName}的房间";
     }
 
     private void LoadOrCreateConfig()
@@ -96,12 +102,13 @@ public sealed class SyncEngine : IDisposable
         RefreshNetworkInfo();
         StartUdp();
         StartTcpHttpServer();
+        _ = ResolveHomeRelayAndConnectAsync();
 
         _media.StateChanged += state =>
         {
             lock (_stateLock) { LocalPlayer = state; }
             NotifyUpdated();
-            BroadcastPresence(includeRelay: !string.IsNullOrEmpty(CurrentRoomCode));
+            BroadcastPresence(includeRelay: true);
         };
         await _media.StartAsync();
 
@@ -112,67 +119,79 @@ public sealed class SyncEngine : IDisposable
     {
         var trimmed = (name ?? "").Trim();
         if (string.IsNullOrEmpty(trimmed)) return;
-        DeviceName = trimmed;
-        SaveConfig();
-        NotifyUpdated();
-        BroadcastPresence(includeRelay: !string.IsNullOrEmpty(CurrentRoomCode));
-    }
-
-    public void CreateRoom()
-    {
-        var code = Random.Shared.Next(1000, 10000).ToString();
-        JoinRoom(code);
-    }
-
-    public void JoinRoom(string code)
-    {
-        var cleaned = (code ?? "").Trim();
-        if (cleaned.Length != 4 || !cleaned.All(char.IsDigit)) return;
-
-        var prev = CurrentRoomCode;
-        if (!string.IsNullOrEmpty(prev) && prev != cleaned)
-            SendLeave(prev);
-
         lock (_stateLock)
         {
-            CurrentRoomCode = cleaned;
-            _peersById.Clear();
+            DeviceName = trimmed;
+            if (CurrentRoomId == DeviceId)
+                CurrentRoomName = $"{trimmed}的房间";
         }
-        StartRelaySubscription(cleaned);
+        SaveConfig();
         NotifyUpdated();
         BroadcastPresence(includeRelay: true);
     }
 
-    public void LeaveRoom()
+    public void JoinRoom(AvailableRoom room)
     {
-        var old = CurrentRoomCode;
-        StopRelaySubscription();
+        if (string.IsNullOrEmpty(room.RoomId) || room.RoomId == CurrentRoomId) return;
+        var oldRoom = CurrentRoomId;
+        if (!string.IsNullOrEmpty(oldRoom))
+            SendLeave(oldRoom);
+
         lock (_stateLock)
         {
-            CurrentRoomCode = "";
-            _peersById.Clear();
+            CurrentRoomId = room.RoomId;
+            CurrentRoomName = room.RoomName;
         }
-        if (!string.IsNullOrEmpty(old))
-            SendLeave(old);
         NotifyUpdated();
-        BroadcastPresence(includeRelay: false);
+        BroadcastPresence(includeRelay: true);
+    }
+
+    public void ReturnToOwnRoom()
+    {
+        if (CurrentRoomId == DeviceId) return;
+        var oldRoom = CurrentRoomId;
+        SendLeave(oldRoom);
+        lock (_stateLock)
+        {
+            CurrentRoomId = DeviceId;
+            CurrentRoomName = $"{DeviceName}的房间";
+        }
+        NotifyUpdated();
+        BroadcastPresence(includeRelay: true);
     }
 
     public List<DeviceRecord> GetRoomPeersSnapshot()
     {
         lock (_stateLock)
         {
-            return _peersById.Values
+            return _allPeersById.Values
+                .Where(p => p.RoomId == CurrentRoomId)
                 .OrderBy(p => p.DeviceName, StringComparer.CurrentCultureIgnoreCase)
                 .ToList();
         }
     }
 
-    public List<string> GetDiscoveredRoomsSnapshot()
+    public List<AvailableRoom> GetAvailableRoomsSnapshot()
     {
         lock (_stateLock)
         {
-            return _discoveredRooms.Keys.OrderBy(k => k).ToList();
+            return _allPeersById.Values
+                .Where(p => p.RoomId != CurrentRoomId)
+                .GroupBy(p => p.RoomId)
+                .Select(g =>
+                {
+                    var host = g.FirstOrDefault(p => p.DeviceId == g.Key) ?? g.First();
+                    return new AvailableRoom
+                    {
+                        RoomId = g.Key,
+                        RoomName = string.IsNullOrWhiteSpace(host.RoomName) ? $"{host.DeviceName}的房间" : host.RoomName,
+                        HostPlatform = host.Platform,
+                        MemberCount = g.Count(),
+                        IsLanDirect = g.Any(p => p.ConnectionMode == "局域网直连")
+                    };
+                })
+                .OrderBy(r => r.RoomName, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
         }
     }
 
@@ -188,14 +207,14 @@ public sealed class SyncEngine : IDisposable
             lock (_stateLock) { ApplyOptimistic(LocalPlayer, action, position); }
             NotifyUpdated();
             _ = _media.ExecuteCommandAsync(action, position);
-            BroadcastPresence(includeRelay: !string.IsNullOrEmpty(CurrentRoomCode));
+            BroadcastPresence(includeRelay: true);
             return;
         }
 
         var cmd = new CommandPacket
         {
             CmdId = "cmd-" + Guid.NewGuid().ToString("N")[..8],
-            RoomCode = CurrentRoomCode,
+            RoomId = CurrentRoomId,
             TargetDeviceId = targetDeviceId,
             Action = action,
             Position = position,
@@ -207,7 +226,7 @@ public sealed class SyncEngine : IDisposable
         int peerPort = 0;
         lock (_stateLock)
         {
-            if (_peersById.TryGetValue(targetDeviceId, out var peer))
+            if (_allPeersById.TryGetValue(targetDeviceId, out var peer))
             {
                 ApplyOptimistic(peer.Player, action, position);
                 peerIp = peer.Ip;
@@ -222,10 +241,8 @@ public sealed class SyncEngine : IDisposable
             SendUdpPacket(cmd, peerIp);
         }
 
-        if (!string.IsNullOrEmpty(CurrentRoomCode))
-        {
-            _ = PublishToRelayAsync(CurrentRoomCode, cmd);
-        }
+        if (!string.IsNullOrEmpty(_homeRelayTopic))
+            _ = PublishToHomeRelayAsync(cmd);
     }
 
     private void OnHeartbeat()
@@ -233,7 +250,7 @@ public sealed class SyncEngine : IDisposable
         _heartbeatTick++;
         if (_heartbeatTick % 10 == 0) RefreshNetworkInfo();
         PruneStalePeers();
-        BroadcastPresence(includeRelay: !string.IsNullOrEmpty(CurrentRoomCode) && (_heartbeatTick % 2 == 0));
+        BroadcastPresence(includeRelay: _heartbeatTick % 2 == 0);
     }
 
     private void RefreshNetworkInfo()
@@ -300,6 +317,106 @@ public sealed class SyncEngine : IDisposable
         }
     }
 
+    // ==================== Home NAT Discovery Channel ====================
+
+    private async Task ResolveHomeRelayAndConnectAsync()
+    {
+        var endpoints = new[] { "https://api4.ipify.org", "https://ipv4.icanhazip.com" };
+        string publicIp = "";
+        foreach (var ep in endpoints)
+        {
+            try
+            {
+                var str = (await _httpClient.GetStringAsync(ep, _cts.Token)).Trim();
+                if (str.Split('.').Length == 4)
+                {
+                    publicIp = str;
+                    break;
+                }
+            }
+            catch { }
+        }
+        if (string.IsNullOrEmpty(publicIp)) return;
+
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes($"lmc-v2-home:{publicIp}"));
+        var hex = Convert.ToHexString(hash).ToLowerInvariant()[..16];
+        _homeRelayTopic = $"lmc_v2_home_{hex}";
+
+        StartRelaySubscription(_homeRelayTopic);
+        BroadcastPresence(includeRelay: true);
+    }
+
+    private void StartRelaySubscription(string topic)
+    {
+        StopRelaySubscription();
+        _relayCts = new CancellationTokenSource();
+        var ct = _relayCts.Token;
+        _ = Task.Run(() => RelayLoopAsync(topic, ct), ct);
+    }
+
+    private void StopRelaySubscription()
+    {
+        try { _relayCts?.Cancel(); } catch { }
+        _relayCts?.Dispose();
+        _relayCts = null;
+    }
+
+    private async Task RelayLoopAsync(string topic, CancellationToken ct)
+    {
+        var url = $"{RelayBase}/{topic}/sse?since=1m";
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                using var resp = await _sseClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                using var stream = await resp.Content.ReadAsStreamAsync(ct);
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                while (!ct.IsCancellationRequested)
+                {
+                    var line = await reader.ReadLineAsync(ct);
+                    if (line == null) break;
+                    if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+                    var raw = line[5..].Trim();
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(raw);
+                        if (doc.RootElement.TryGetProperty("event", out var ev) && ev.GetString() == "message"
+                            && doc.RootElement.TryGetProperty("message", out var msg))
+                        {
+                            var inner = msg.GetString();
+                            if (!string.IsNullOrEmpty(inner))
+                                HandleIncomingJson(inner, "网络同步", "");
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch
+            {
+                try { await Task.Delay(2000, ct); } catch { break; }
+            }
+        }
+    }
+
+    private async Task PublishToHomeRelayAsync<T>(T payload)
+    {
+        var topic = _homeRelayTopic;
+        if (string.IsNullOrEmpty(topic)) return;
+        try
+        {
+            var json = JsonSerializer.Serialize(payload, ProtocolJson.Options);
+            using var content = new StringContent(json, Encoding.UTF8, "text/plain");
+            await _httpClient.PostAsync($"{RelayBase}/{topic}", content);
+        }
+        catch { }
+    }
+
     // ==================== UDP Discovery & Presence (41234) ====================
 
     private void StartUdp()
@@ -310,24 +427,14 @@ public sealed class SyncEngine : IDisposable
             udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             udp.Client.Bind(new IPEndPoint(IPAddress.Any, UdpPort));
             udp.EnableBroadcast = true;
-            try
-            {
-                udp.JoinMulticastGroup(IPAddress.Parse(MulticastGroup));
-            }
-            catch { }
+            try { udp.JoinMulticastGroup(IPAddress.Parse(MulticastGroup)); } catch { }
 
             _udpClient = udp;
             _ = Task.Run(() => UdpReceiveLoopAsync(udp, _cts.Token));
         }
         catch
         {
-            // Fallback: send-only UDP socket if bind failed
-            try
-            {
-                var udp = new UdpClient(0) { EnableBroadcast = true };
-                _udpClient = udp;
-            }
-            catch { }
+            try { _udpClient = new UdpClient(0) { EnableBroadcast = true }; } catch { }
         }
     }
 
@@ -341,33 +448,32 @@ public sealed class SyncEngine : IDisposable
                 var json = Encoding.UTF8.GetString(res.Buffer);
                 HandleIncomingJson(json, "局域网直连", res.RemoteEndPoint.Address.ToString());
             }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch
-            {
-                await Task.Delay(100, ct);
-            }
+            catch (OperationCanceledException) { break; }
+            catch { await Task.Delay(100, ct); }
         }
     }
 
     private void BroadcastPresence(bool includeRelay)
     {
         PlayerState playerSnap;
-        string room;
+        string roomId;
+        string roomName;
+        string devName;
         lock (_stateLock)
         {
             playerSnap = LocalPlayer.Clone();
-            room = CurrentRoomCode;
+            roomId = CurrentRoomId;
+            roomName = CurrentRoomName;
+            devName = DeviceName;
         }
 
         var packet = new PresencePacket
         {
             DeviceId = DeviceId,
-            DeviceName = DeviceName,
+            DeviceName = devName,
             Platform = "windows",
-            RoomCode = room,
+            RoomId = roomId,
+            RoomName = roomName,
             LanName = _resolvedRealSsid,
             Ip = _localIp,
             Subnet = _localSubnet,
@@ -381,23 +487,23 @@ public sealed class SyncEngine : IDisposable
         foreach (var host in targets)
             SendUdpBytes(bytes, host);
 
-        if (includeRelay && !string.IsNullOrEmpty(room))
-            _ = PublishToRelayAsync(room, packet);
+        if (includeRelay && !string.IsNullOrEmpty(_homeRelayTopic))
+            _ = PublishToHomeRelayAsync(packet);
     }
 
-    private void SendLeave(string roomCode)
+    private void SendLeave(string roomId)
     {
         var packet = new LeavePacket
         {
             DeviceId = DeviceId,
-            RoomCode = roomCode,
+            RoomId = roomId,
             Ts = ProtocolJson.NowMillis()
         };
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet, ProtocolJson.Options));
         var targets = new HashSet<string>(_broadcastAddresses) { MulticastGroup, "255.255.255.255" };
         foreach (var host in targets)
             SendUdpBytes(bytes, host);
-        _ = PublishToRelayAsync(roomCode, packet);
+        _ = PublishToHomeRelayAsync(packet);
     }
 
     private void SendUdpPacket<T>(T payload, string host)
@@ -409,11 +515,7 @@ public sealed class SyncEngine : IDisposable
     private void SendUdpBytes(byte[] bytes, string host)
     {
         if (_udpClient == null) return;
-        try
-        {
-            _udpClient.Send(bytes, bytes.Length, host, UdpPort);
-        }
-        catch { }
+        try { _udpClient.Send(bytes, bytes.Length, host, UdpPort); } catch { }
     }
 
     // ==================== Raw TCP HTTP Control Server (No Admin UAC Needed!) ====================
@@ -444,14 +546,8 @@ public sealed class SyncEngine : IDisposable
                 var client = await listener.AcceptTcpClientAsync(ct);
                 _ = Task.Run(() => HandleTcpClientAsync(client, ct), ct);
             }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch
-            {
-                await Task.Delay(100, ct);
-            }
+            catch (OperationCanceledException) { break; }
+            catch { await Task.Delay(100, ct); }
         }
     }
 
@@ -519,77 +615,6 @@ public sealed class SyncEngine : IDisposable
         catch { }
     }
 
-    // ==================== Automatic Room Relay Fallback ====================
-
-    private void StartRelaySubscription(string roomCode)
-    {
-        StopRelaySubscription();
-        _relayCts = new CancellationTokenSource();
-        var ct = _relayCts.Token;
-        _ = Task.Run(() => RelayLoopAsync(roomCode, ct), ct);
-    }
-
-    private void StopRelaySubscription()
-    {
-        try { _relayCts?.Cancel(); } catch { }
-        _relayCts?.Dispose();
-        _relayCts = null;
-    }
-
-    private async Task RelayLoopAsync(string roomCode, CancellationToken ct)
-    {
-        var url = $"{RelayBase}/lmc_v2_r_{roomCode}/sse?since=2m";
-        while (!ct.IsCancellationRequested)
-        {
-            try
-            {
-                using var req = new HttpRequestMessage(HttpMethod.Get, url);
-                using var resp = await _sseClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-                using var stream = await resp.Content.ReadAsStreamAsync(ct);
-                using var reader = new StreamReader(stream, Encoding.UTF8);
-
-                while (!ct.IsCancellationRequested)
-                {
-                    var line = await reader.ReadLineAsync(ct);
-                    if (line == null) break;
-                    if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
-                    var raw = line[5..].Trim();
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(raw);
-                        if (doc.RootElement.TryGetProperty("event", out var ev) && ev.GetString() == "message"
-                            && doc.RootElement.TryGetProperty("message", out var msg))
-                        {
-                            var inner = msg.GetString();
-                            if (!string.IsNullOrEmpty(inner))
-                                HandleIncomingJson(inner, "中继同步", "");
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch
-            {
-                try { await Task.Delay(2000, ct); } catch { break; }
-            }
-        }
-    }
-
-    private async Task PublishToRelayAsync<T>(string roomCode, T payload)
-    {
-        try
-        {
-            var json = JsonSerializer.Serialize(payload, ProtocolJson.Options);
-            using var content = new StringContent(json, Encoding.UTF8, "text/plain");
-            await _httpClient.PostAsync($"{RelayBase}/lmc_v2_r_{roomCode}", content);
-        }
-        catch { }
-    }
-
     // ==================== Unified Packet Processing ====================
 
     private void HandleIncomingJson(string json, string sourceMode, string senderIp)
@@ -615,54 +640,54 @@ public sealed class SyncEngine : IDisposable
                     UpdateDisplayedLanName();
                 }
 
+                var effIp = !string.IsNullOrEmpty(senderIp) ? senderIp : pkt.Ip;
+                var roomId = string.IsNullOrEmpty(pkt.RoomId) ? pkt.DeviceId : pkt.RoomId;
+                var roomName = string.IsNullOrEmpty(pkt.RoomName) ? $"{pkt.DeviceName}的房间" : pkt.RoomName;
+
                 bool shouldReply = false;
                 bool changed = false;
 
                 lock (_stateLock)
                 {
-                    if (sourceMode == "局域网直连" && pkt.RoomCode.Length == 4 && pkt.RoomCode.All(char.IsDigit))
-                    {
-                        if (!_discoveredRooms.ContainsKey(pkt.RoomCode)) changed = true;
-                        _discoveredRooms[pkt.RoomCode] = now;
-                    }
+                    if (roomId == CurrentRoomId && pkt.DeviceId == roomId && !string.IsNullOrWhiteSpace(roomName))
+                        CurrentRoomName = roomName;
 
-                    if (!string.IsNullOrEmpty(CurrentRoomCode) && pkt.RoomCode == CurrentRoomCode)
+                    if (_allPeersById.TryGetValue(pkt.DeviceId, out var existing))
                     {
-                        var effIp = !string.IsNullOrEmpty(senderIp) ? senderIp : pkt.Ip;
-                        if (_peersById.TryGetValue(pkt.DeviceId, out var existing))
+                        if (pkt.Ts < existing.LastPacketTs) return;
+                        existing.DeviceName = pkt.DeviceName;
+                        existing.Platform = pkt.Platform;
+                        existing.RoomId = roomId;
+                        existing.RoomName = roomName;
+                        existing.LanName = pkt.LanName;
+                        if (!string.IsNullOrEmpty(effIp)) existing.Ip = effIp;
+                        if (pkt.HttpPort > 0) existing.HttpPort = pkt.HttpPort;
+                        existing.LastSeen = now;
+                        existing.LastPacketTs = pkt.Ts;
+                        if (sourceMode == "局域网直连") existing.ConnectionMode = "局域网直连";
+                        existing.Player = pkt.Player ?? new PlayerState();
+                        changed = true;
+                    }
+                    else
+                    {
+                        _allPeersById[pkt.DeviceId] = new DeviceRecord
                         {
-                            if (pkt.Ts < existing.LastPacketTs) return;
-                            existing.DeviceName = pkt.DeviceName;
-                            existing.Platform = pkt.Platform;
-                            existing.LanName = pkt.LanName;
-                            if (!string.IsNullOrEmpty(effIp)) existing.Ip = effIp;
-                            if (pkt.HttpPort > 0) existing.HttpPort = pkt.HttpPort;
-                            existing.LastSeen = now;
-                            existing.LastPacketTs = pkt.Ts;
-                            if (sourceMode == "局域网直连") existing.ConnectionMode = "局域网直连";
-                            existing.Player = pkt.Player ?? new PlayerState();
-                            changed = true;
-                        }
-                        else
-                        {
-                            _peersById[pkt.DeviceId] = new DeviceRecord
-                            {
-                                DeviceId = pkt.DeviceId,
-                                DeviceName = pkt.DeviceName,
-                                Platform = pkt.Platform,
-                                RoomCode = pkt.RoomCode,
-                                LanName = pkt.LanName,
-                                Ip = effIp,
-                                Subnet = pkt.Subnet,
-                                HttpPort = pkt.HttpPort,
-                                LastSeen = now,
-                                LastPacketTs = pkt.Ts,
-                                ConnectionMode = sourceMode,
-                                Player = pkt.Player ?? new PlayerState()
-                            };
-                            shouldReply = true;
-                            changed = true;
-                        }
+                            DeviceId = pkt.DeviceId,
+                            DeviceName = pkt.DeviceName,
+                            Platform = pkt.Platform,
+                            RoomId = roomId,
+                            RoomName = roomName,
+                            LanName = pkt.LanName,
+                            Ip = effIp,
+                            Subnet = pkt.Subnet,
+                            HttpPort = pkt.HttpPort,
+                            LastSeen = now,
+                            LastPacketTs = pkt.Ts,
+                            ConnectionMode = sourceMode,
+                            Player = pkt.Player ?? new PlayerState()
+                        };
+                        shouldReply = true;
+                        changed = true;
                     }
                 }
 
@@ -673,19 +698,27 @@ public sealed class SyncEngine : IDisposable
             {
                 var pkt = JsonSerializer.Deserialize<LeavePacket>(json, ProtocolJson.Options);
                 if (pkt == null || string.IsNullOrEmpty(pkt.DeviceId) || pkt.DeviceId == DeviceId) return;
-                bool removed = false;
+                bool changed = false;
                 lock (_stateLock)
                 {
-                    if (_peersById.TryGetValue(pkt.DeviceId, out var existing) && pkt.Ts >= existing.LastPacketTs)
-                        removed = _peersById.Remove(pkt.DeviceId);
+                    if (_allPeersById.TryGetValue(pkt.DeviceId, out var existing)
+                        && pkt.Ts >= existing.LastPacketTs
+                        && existing.RoomId == pkt.RoomId)
+                    {
+                        existing.RoomId = existing.DeviceId;
+                        existing.RoomName = $"{existing.DeviceName}的房间";
+                        existing.LastPacketTs = pkt.Ts;
+                        changed = true;
+                    }
                 }
-                if (removed) NotifyUpdated();
+                if (changed) NotifyUpdated();
             }
             else if (type == "command")
             {
                 var cmd = JsonSerializer.Deserialize<CommandPacket>(json, ProtocolJson.Options);
                 if (cmd == null || string.IsNullOrEmpty(cmd.CmdId)) return;
                 if (cmd.Ts < _startupMs - 5000) return;
+                if (cmd.RoomId != CurrentRoomId) return;
                 if (!_executedCmdIds.TryAdd(cmd.CmdId, 1)) return;
 
                 if (cmd.TargetDeviceId == DeviceId)
@@ -693,7 +726,7 @@ public sealed class SyncEngine : IDisposable
                     lock (_stateLock) { ApplyOptimistic(LocalPlayer, cmd.Action, cmd.Position); }
                     NotifyUpdated();
                     _ = _media.ExecuteCommandAsync(cmd.Action, cmd.Position);
-                    BroadcastPresence(includeRelay: !string.IsNullOrEmpty(CurrentRoomCode));
+                    BroadcastPresence(includeRelay: true);
                 }
             }
         }
@@ -706,19 +739,13 @@ public sealed class SyncEngine : IDisposable
         bool changed = false;
         lock (_stateLock)
         {
-            var stalePeers = _peersById.Where(kv => now - kv.Value.LastSeen > 14000).Select(kv => kv.Key).ToList();
-            foreach (var id in stalePeers) { _peersById.Remove(id); changed = true; }
-
-            var staleRooms = _discoveredRooms.Where(kv => now - kv.Value > 15000).Select(kv => kv.Key).ToList();
-            foreach (var r in staleRooms) { _discoveredRooms.Remove(r); changed = true; }
+            var stale = _allPeersById.Where(kv => now - kv.Value.LastSeen > 14000).Select(kv => kv.Key).ToList();
+            foreach (var id in stale) { _allPeersById.Remove(id); changed = true; }
         }
         if (changed) NotifyUpdated();
     }
 
-    private void NotifyUpdated()
-    {
-        StateUpdated?.Invoke();
-    }
+    private void NotifyUpdated() => StateUpdated?.Invoke();
 
     public void Dispose()
     {
